@@ -128,6 +128,13 @@ fn unknown_agreement_id_never_panics() {
         client.try_extend_agreement_ttl(&missing, &payer),
         Err(Ok(TrellisError::AgreementNotFound))
     );
+    // `rotate_resolver` reads the header before it reaches either
+    // `require_auth`, so an unknown ID surfaces the typed error rather than a
+    // trap (#452).
+    assert_eq!(
+        client.try_rotate_resolver(&missing, &payee),
+        Err(Ok(TrellisError::AgreementNotFound))
+    );
     // `Agreement` derives `PartialEq`, so the full `Result` can be compared
     // directly — no field-by-field unpacking needed.
     assert_eq!(

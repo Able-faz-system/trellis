@@ -2699,6 +2699,10 @@ fn test_agreement_not_found_on_mutating_entrypoints() {
         client.try_expire_milestone(&payer, &missing, &0u32),
         "expire_milestone"
     );
+    assert_agreement_not_found!(
+        client.try_rotate_resolver(&missing, &payer),
+        "rotate_resolver"
+    );
 
     // None of the rejected calls created an entry: the ID is still unknown.
     assert_eq!(client.get_milestone(&missing, &0u32), None);
@@ -2804,5 +2808,306 @@ fn test_invalid_milestone_on_mutating_entrypoints() {
         token_client.balance(&payee),
         0,
         "a rejected index must not release any funds"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dispute resolver rotation (#452)
+// ---------------------------------------------------------------------------
+
+/// A rotation replaces the resolver, reports it through `get_agreement`, and
+/// emits the dedicated `resolver_rotated` event carrying both addresses.
+///
+/// Both addresses matter: `get_agreement` only ever exposes the incumbent, so
+/// the event is the only record of who was able to settle disputes raised
+/// before the rotation.
+#[test]
+fn test_rotate_resolver_updates_agreement_and_emits_event() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 130);
+    let new_resolver = Address::generate(&env);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+
+    client.rotate_resolver(&id, &new_resolver);
+
+    // Assert the event straight after the call: `env.events().all()` only
+    // reports the latest invocation, so the `get_agreement` view below would
+    // clear it.
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_rrot")],
+        "rotate_resolver must emit exactly one event, naming itself",
+    );
+    let (old_resolver, emitted_new_resolver): (Address, Address) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_rrot"));
+    assert_eq!(
+        old_resolver, dispute_resolver,
+        "resolver_rotated must record the outgoing resolver"
+    );
+    assert_eq!(
+        emitted_new_resolver, new_resolver,
+        "resolver_rotated must record the incoming resolver"
+    );
+
+    assert_eq!(
+        client.get_agreement(&id).dispute_resolver,
+        new_resolver,
+        "get_agreement must report the replacement resolver after a rotation"
+    );
+}
+
+/// `rotate_resolver` is gated on the payer *and* the payee signing, so with no
+/// signature at all the call traps before touching any state.
+///
+/// Both signatures are required because a single-party gate would let either
+/// side install a resolver it controls and then have that resolver adjudicate
+/// the resulting dispute.
+#[test]
+#[should_panic(expected = "InvalidAction")]
+fn test_rotate_resolver_without_auth_traps() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 131);
+    let new_resolver = Address::generate(&env);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+
+    // Both `require_auth` calls fail, so the host traps.
+    deny_all_auth(&env);
+    client.rotate_resolver(&id, &new_resolver);
+}
+
+/// The neutrality invariant `init` enforces must survive every rotation: a
+/// party address can never be installed as the resolver, however many
+/// rotations happen. A rejected rotation leaves the incumbent in place.
+#[test]
+fn test_rotate_resolver_rejects_a_party_as_the_new_resolver() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 132);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+
+    for party in [&payer, &payee] {
+        assert_eq!(
+            client.try_rotate_resolver(&id, party),
+            Err(Ok(TrellisError::ResolverCannotBeParty)),
+            "neither the payer nor the payee may be installed as the resolver"
+        );
+        assert_eq!(
+            client.get_agreement(&id).dispute_resolver,
+            dispute_resolver,
+            "a rejected rotation must leave the incumbent resolver in place"
+        );
+    }
+}
+
+/// The rescue path this entrypoint exists for: a milestone is already
+/// `Disputed` when the resolver goes dark, leaving it unsettleable.
+///
+/// Rotation must leave the dispute open — it hands the ruling over, it does not
+/// substitute for one — and the replacement must then be able to settle it and
+/// move the escrowed funds.
+#[test]
+fn test_rotate_resolver_unblocks_a_disputed_milestone() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    let id = agreement_id(&env, 133);
+    let new_resolver = Address::generate(&env);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+    client.raise_dispute(&payee, &id, &0u32, &None);
+
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Disputed),
+        "the milestone must be Disputed before the rotation"
+    );
+
+    client.rotate_resolver(&id, &new_resolver);
+
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Disputed),
+        "rotating the resolver must neither settle nor re-open the dispute"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        0,
+        "rotating the resolver must not move any funds"
+    );
+    assert_eq!(
+        token_client.balance(&client.address),
+        500,
+        "the escrowed amount must stay in the contract across the rotation"
+    );
+
+    client.resolve_dispute(&id, &0u32, &false);
+
+    assert_eq!(
+        client.get_milestone(&id, &0u32).map(|m| m.status),
+        Some(EscrowStatus::Completed),
+        "the replacement resolver must be able to settle the stranded dispute"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        500,
+        "the ruling must pay the still-escrowed amount to the payee"
+    );
+}
+
+/// Rotation moves the resolving authority rather than widening it: the
+/// replacement is the address `resolve_dispute` demands a signature from, and
+/// the outgoing resolver is never asked to sign again.
+#[test]
+fn test_rotate_resolver_transfers_resolving_authority() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let id = agreement_id(&env, 134);
+    let new_resolver = Address::generate(&env);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+    client.raise_dispute(&payee, &id, &0u32, &None);
+    client.rotate_resolver(&id, &new_resolver);
+
+    client.resolve_dispute(&id, &0u32, &false);
+
+    // `env.auths()` reports which addresses the most recent top-level
+    // invocation demanded a signature from, which is exactly the set
+    // `resolve_dispute`'s `dispute_resolver.require_auth()` gate asks for.
+    let mut asked_replacement = false;
+    let mut asked_outgoing = false;
+    for (address, _invocation) in env.auths() {
+        if address == new_resolver {
+            asked_replacement = true;
+        }
+        if address == dispute_resolver {
+            asked_outgoing = true;
+        }
+    }
+
+    assert!(
+        asked_replacement,
+        "resolve_dispute must demand the replacement resolver's signature"
+    );
+    assert!(
+        !asked_outgoing,
+        "the outgoing resolver must lose all authority once it is replaced"
+    );
+}
+
+/// The adjacent case that a careless fix could regress: rotation rewrites the
+/// whole header, so every *other* agreement-level field has to survive it —
+/// including the cumulative `released_amounts` entry a `release_partial` has
+/// already recorded and the funds still sitting in escrow.
+#[test]
+fn test_rotate_resolver_preserves_escrow_and_release_state() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    let id = agreement_id(&env, 135);
+    let new_resolver = Address::generate(&env);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &one_milestone(&env, 500),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+    assert_eq!(
+        client.release_partial(&id, &0u32, &200i128),
+        300,
+        "a partial release must leave the remainder escrowed"
+    );
+
+    let before = client.get_agreement(&id);
+    client.rotate_resolver(&id, &new_resolver);
+    let after = client.get_agreement(&id);
+
+    assert_eq!(
+        after.agreement_id, before.agreement_id,
+        "rotation must not change the agreement ID"
+    );
+    assert_eq!(
+        after.payer, before.payer,
+        "rotation must not change the payer"
+    );
+    assert_eq!(
+        after.payee, before.payee,
+        "rotation must not change the payee"
+    );
+    assert_eq!(
+        after.token, before.token,
+        "rotation must not change the token"
+    );
+    assert_eq!(
+        after.total_amount, before.total_amount,
+        "rotation must not change the agreement total"
+    );
+    assert_eq!(
+        after.milestones, before.milestones,
+        "rotation must not change any milestone status"
+    );
+    assert_eq!(
+        after.released_amounts, before.released_amounts,
+        "rotation must not disturb the cumulative release ledger"
+    );
+    assert_eq!(
+        after.dispute_resolver, new_resolver,
+        "the resolver is the only field a rotation may change"
+    );
+
+    assert_eq!(
+        token_client.balance(&client.address),
+        300,
+        "rotation must leave the un-released remainder escrowed"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        200,
+        "rotation must not claw back funds already released"
+    );
+    assert_eq!(
+        token_client.balance(&payer),
+        10_000 - 500,
+        "rotation must not move the payer's remaining balance"
     );
 }

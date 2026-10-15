@@ -176,15 +176,15 @@ cd contracts/trellis_core
 cargo test
 ```
 
-The suite currently runs **83 tests**, split across four modules:
+The suite currently runs **89 tests**, split across four modules:
 
 | Module | Tests | Coverage |
 | --- | --- | --- |
-| `src/test.rs` | 57 | Example-based lifecycle, error paths, role checks, TTL extension, and the `init`-atomicity / funding-order / not-found / out-of-range index suites |
+| `src/test.rs` | 63 | Example-based lifecycle, error paths, role checks, TTL extension, resolver rotation, and the `init`-atomicity / funding-order / not-found / out-of-range index suites |
 | `src/test_properties.rs` | 14 | `proptest` invariants — balance conservation, invalid amounts, and milestone isolation |
 | `src/test_panic_boundaries.rs` | 9 | Panic-boundary and fuzz coverage for every entrypoint |
 | `src/test_storage.rs` | 3 | Per-milestone ledger layout and TTL behaviour |
-| **Total** | **83** | |
+| **Total** | **89** | |
 
 Representative example-based tests in `src/test.rs` include `test_happy_path`, `test_double_init_fails`, `test_dispute_and_refund_to_payer`, `test_cancel_unfunded_milestone`, `test_cancel_funded_milestone_fails_with_invalid_state_transition`, `test_get_agreement`, `test_get_milestone_unknown_agreement_returns_error`, `test_batch_lock_funds_partial_failure`, `test_failed_zero_amount_init_leaves_no_state_corruption`, `test_multi_milestone_funding_order_independent`, `test_batch_lock_funds_out_of_order_ids`, `test_agreement_not_found_on_mutating_entrypoints`, `test_invalid_milestone_on_mutating_entrypoints`, and the six `*_wrong_role_fails` authorization tests.
 
@@ -318,7 +318,7 @@ Rules for changing ownership:
 
 All of the following must be true before requesting review:
 
-- `cargo test` passes 83/83 in `contracts/trellis_core`.
+- `cargo test` passes 89/89 in `contracts/trellis_core`.
 - `cargo build` passes with zero warnings in both Rust crates you touched.
 - The PR description explains what changed and why.
 - The PR references the issue number using `Closes #X`.

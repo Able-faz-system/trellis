@@ -656,6 +656,91 @@ impl TrellisContract {
         Ok(())
     }
 
+    /// Replace the agreement's dispute resolver.
+    ///
+    /// `dispute_resolver` is otherwise fixed at [`Self::init`] for the whole
+    /// lifetime of the agreement. If that resolver's signing key is lost, it is
+    /// compromised, or the operator simply stops answering, every milestone
+    /// that reaches [`EscrowStatus::Disputed`] is permanently unsettleable:
+    /// [`Self::resolve_dispute`] and [`Self::resolve_dispute_split`] are gated
+    /// solely by `agreement.dispute_resolver.require_auth()`. This entrypoint
+    /// closes that single point of failure.
+    ///
+    /// # Auth
+    /// **Both** the payer and the payee must authorise the call
+    /// (`header.payer.require_auth()` followed by `header.payee.require_auth()`).
+    ///
+    /// Requiring both parties is what stops the rotation being an attack in its
+    /// own right. A single-party gate would let either side install a resolver
+    /// it controls and then rule on the resulting dispute — the resolver would
+    /// be adjudicating an escrow it has a stake in. With two signatures, a
+    /// colluding resolver-plus-one-party cannot swap in a friendly arbiter.
+    ///
+    /// The **outgoing resolver is deliberately not required to sign.** That is
+    /// the entire point of this entrypoint: the situations it exists for —
+    /// a lost key, a compromised key, an operator that has stopped responding —
+    /// are all cases where the outgoing resolver's signature is either
+    /// unavailable or worthless. Requiring it would make rotation impossible in
+    /// precisely the scenario it was written for. The incoming resolver does
+    /// not sign at rotation time either; it acquires the authority to settle
+    /// disputes the moment this call succeeds.
+    ///
+    /// # Effect
+    /// Only `dispute_resolver` changes. Milestone statuses, escrowed amounts,
+    /// `total_amount`, `released_amounts`, deadlines and every other header
+    /// field are untouched, and no tokens move — so the rotation is safe to
+    /// perform at any point in the agreement's life, **including while a
+    /// milestone is actively `Disputed`**. That is the rescue path: a dispute
+    /// raised against a resolver that has since gone dark can be settled by the
+    /// replacement as soon as the rotation lands.
+    ///
+    /// The rotation is immediate and not retroactive. A `Disputed` milestone
+    /// stays `Disputed` — rotation does not settle it — it just changes *who*
+    /// is able to settle it. Milestones already settled are final and are never
+    /// re-opened; the outgoing resolver's past rulings stand.
+    ///
+    /// # Events
+    /// Emits `("resolver_rotated", agreement_id)` carrying both the old and the
+    /// new resolver address, so the full resolver history of an agreement is
+    /// reconstructible from the event log alone.
+    ///
+    /// # Errors
+    /// - [`TrellisError::AgreementNotFound`] – unknown agreement ID.
+    /// - [`TrellisError::ResolverCannotBeParty`] – `new_resolver` equals
+    ///   `payer` or `payee`. This mirrors the identical guard in [`Self::init`],
+    ///   so an address can never become a party's own resolver no matter how
+    ///   many rotations happen.
+    pub fn rotate_resolver(
+        env: Env,
+        agreement_id: BytesN<32>,
+        new_resolver: Address,
+    ) -> Result<(), TrellisError> {
+        // #401: header only — one read and one write, never the milestone vector.
+        let mut header = storage::read_header(&env, &agreement_id)?;
+
+        // Both parties consent. See the "Auth" section above for why the
+        // outgoing resolver is not asked to sign.
+        header.payer.require_auth();
+        header.payee.require_auth();
+
+        // Same neutrality invariant `init` enforces, re-checked on every
+        // rotation so a party address can never be installed as the resolver.
+        if new_resolver == header.payer || new_resolver == header.payee {
+            return Err(TrellisError::ResolverCannotBeParty);
+        }
+
+        let old_resolver = header.dispute_resolver.clone();
+        header.dispute_resolver = new_resolver.clone();
+        storage::write_header(&env, &agreement_id, &header);
+
+        // Record both addresses: `get_agreement` only ever exposes the current
+        // resolver, so this event is the only record of who held the role
+        // before.
+        events::resolver_rotated(&env, agreement_id, old_resolver, new_resolver);
+
+        Ok(())
+    }
+
     /// Cancel a milestone that was never funded (status = `Pending`).
     ///
     /// Only the payer may withdraw a milestone proposal that has not yet had

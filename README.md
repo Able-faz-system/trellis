@@ -482,6 +482,7 @@ Trellis is a monorepo with three layers:
 | `release_partial` | Payer | Releases part of a `Funded`/`WorkSubmitted` milestone's escrowed funds as a progress payment; the milestone completes once fully released |
 | `raise_dispute` | Payer or Payee | Flags a milestone for resolver review |
 | `resolve_dispute` | Dispute Resolver | Rules on a dispute — refunds payer or pays payee |
+| `rotate_resolver` | Payer and Payee | Replaces the dispute resolver when the incumbent is lost, compromised or unresponsive; the outgoing resolver does not have to sign |
 | `cancel_unfunded_milestone` | Payer | Cancels a milestone that was never funded — status becomes `Cancelled`, never `Refunded` (reserved for dispute refunds) |
 | `get_agreement` | Anyone | Returns the full current state of an agreement (read-only) |
 | `get_total_amount` | Anyone | Returns the agreement's total value — sum of all milestone amounts (read-only) |
@@ -516,6 +517,20 @@ A milestone can carry an optional deadline so an unresponsive counterparty canno
 </ul>
 
 Tradeoffs: timestamps are used instead of ledger sequences because deadlines are agreed in wall-clock terms and ledger close times vary; validators bound timestamp drift, so this is precise to within seconds, not to the ledger. Expiry is an explicit call rather than automatic, because Soroban has no scheduler. Deadlines live in a separate storage entry (not a <code>Milestone</code> field), so the <code>init</code> argument layout and every existing caller are unchanged. That entry has its TTL renewed alongside the agreement's.
+</details>
+
+<details>
+<summary>🔁 <strong>Rotating the Dispute Resolver</strong></summary>
+<br />
+The dispute resolver is chosen at <code>init</code> and is otherwise fixed for the agreement's lifetime. Because <code>resolve_dispute</code> and <code>resolve_dispute_split</code> are gated solely by that address, a resolver whose key is lost or compromised — or which simply stops answering — would leave every <code>Disputed</code> milestone permanently unsettleable. <code>rotate_resolver</code> closes that single point of failure:
+
+<pre><code>rotate_resolver &#40;agreement_id, new_resolver&#41;</code></pre>
+
+Both the payer and the payee must sign. That is what stops the rotation becoming an attack in its own right: with a single-party gate, either side could install a resolver it controls and then have that resolver rule on the resulting dispute. The <em>outgoing</em> resolver is deliberately not asked to sign — the situations this entrypoint exists for are exactly those where its signature is unavailable or worthless. The incoming resolver does not sign either; it gains the authority to settle disputes the moment the rotation lands.
+
+Rotation only changes <code>dispute_resolver</code>. Milestone statuses, escrowed balances, <code>total_amount</code>, release ledgers and deadlines are untouched and no tokens move, so it is safe at any point in the agreement's life — <strong>including while a milestone is actively <code>Disputed</code></strong>. That is the rescue path: rotation hands the ruling over, it does not substitute for one, so the dispute stays open and the replacement settles it. Milestones already ruled on are final and are never re-opened.
+
+The new resolver must not be the payer or the payee — the same neutrality invariant <code>init</code> enforces, re-checked on every rotation. Each rotation emits a <code>resolver_rotated</code> event carrying both the old and the new address, so the full resolver history of an agreement is reconstructible from the event log even though <code>get_agreement</code> only ever exposes the incumbent.
 </details>
 
 ### Tech Stack
@@ -560,7 +575,7 @@ cd contracts/trellis_core
 cargo test
 ```
 
-The suite has 51 tests, all run in the Soroban sandbox: 31 example-based tests in `test.rs` (happy path, double-init protection, dispute resolution, milestone cancellation, role checks, batch operations, TTL extension, and the `get_agreement` view function), 11 property-based `proptest` tests in `test_properties.rs` (balance conservation, invalid amounts, milestone isolation), and 9 panic-boundary tests in `test_panic_boundaries.rs`.
+The suite has 89 tests, all run in the Soroban sandbox: 63 example-based tests in `test.rs` (happy path, double-init protection, dispute resolution, resolver rotation, milestone cancellation, role checks, batch operations, TTL extension, and the `get_agreement` view function), 14 property-based `proptest` tests in `test_properties.rs` (balance conservation, invalid amounts, milestone isolation), 9 panic-boundary tests in `test_panic_boundaries.rs`, and 3 storage-layout tests in `test_storage.rs`.
 
 ### 📦 Build everything at once
 
@@ -730,9 +745,9 @@ Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 
 ### ✅ Complete
 
-- Core Soroban escrow contract — all 12 entrypoints implemented and tested
+- Core Soroban escrow contract - all 13 entrypoints implemented and tested
 - Full state machine — happy path, dispute resolution, and cancellation paths
-- Contract test suite — 51 tests in the Soroban sandbox
+- Contract test suite - 89 tests in the Soroban sandbox
 - Full CLI — all 8 commands wired end-to-end with JSON, dry-run, and human-readable output modes
 - Native ScVal encoding — scalar arguments and the `Vec<Milestone>` argument to `init` are built directly in Rust
 - Deployed live on Stellar testnet — `init` and `status` verified against the live contract
