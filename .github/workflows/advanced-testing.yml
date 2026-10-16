@@ -100,29 +100,67 @@ jobs:
       
       - name: Run mutation tests
         working-directory: contracts/trellis_core
+        # `--output DIR` names the directory in which cargo-mutants creates
+        # `mutants.out/`; it is not a format flag. The machine-readable
+        # results live in `mutants-out/mutants.out/outcomes.json` (#610).
+        #
+        # cargo-mutants exits 2 when some mutants were missed and 3 when some
+        # timed out. Those are expected outcomes that the score gate below
+        # judges, so only other non-zero codes (usage error, baseline failure)
+        # fail this step.
         run: |
-          cargo mutants --output json > mutants.json
-          cat mutants.json
-        continue-on-error: true
-      
+          set +e
+          cargo mutants --output mutants-out
+          STATUS=$?
+          set -e
+          echo "cargo mutants exited with status $STATUS"
+          case "$STATUS" in
+            0|2|3) ;;
+            *) echo "❌ cargo mutants failed (exit $STATUS)"; exit "$STATUS" ;;
+          esac
+
       - name: Upload mutation results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-test-results
-          path: contracts/trellis_core/mutants.json
-      
+          path: contracts/trellis_core/mutants-out/mutants.out
+          if-no-files-found: error
+
       - name: Check mutation score
         working-directory: contracts/trellis_core
         run: |
-          # Extract caught vs missed counts from mutants.json
-          CAUGHT=$(jq '[.outcomes[] | select(.result == "caught")] | length' mutants.json)
-          TOTAL=$(jq '.outcomes | length' mutants.json)
-          SCORE=$((CAUGHT * 100 / TOTAL))
-          
-          echo "Mutation Score: $SCORE% ($CAUGHT/$TOTAL caught)"
-          
-          if [ $SCORE -lt 80 ]; then
+          OUTCOMES=mutants-out/mutants.out/outcomes.json
+          if [ ! -f "$OUTCOMES" ]; then
+            echo "❌ $OUTCOMES not found"
+            exit 1
+          fi
+
+          # Top-level counters written by cargo-mutants. Unviable mutants
+          # (ones that do not compile) are excluded from the score; timeouts
+          # count as detected since the mutation changed observable behaviour.
+          CAUGHT=$(jq '.caught // 0' "$OUTCOMES")
+          MISSED=$(jq '.missed // 0' "$OUTCOMES")
+          TIMEOUT=$(jq '.timeout // 0' "$OUTCOMES")
+          UNVIABLE=$(jq '.unviable // 0' "$OUTCOMES")
+          DETECTED=$((CAUGHT + TIMEOUT))
+          TOTAL=$((CAUGHT + MISSED + TIMEOUT))
+
+          echo "caught=$CAUGHT missed=$MISSED timeout=$TIMEOUT unviable=$UNVIABLE"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "❌ No viable mutants were tested; cannot compute a mutation score"
+            exit 1
+          fi
+
+          SCORE=$((DETECTED * 100 / TOTAL))
+          echo "Mutation Score: $SCORE% ($DETECTED/$TOTAL detected)"
+          echo "### Mutation score: $SCORE% ($DETECTED/$TOTAL detected, $MISSED missed)" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$SCORE" -lt 80 ]; then
             echo "❌ Mutation score below 80% threshold"
+            echo "Missed mutants:"
+            cat mutants-out/mutants.out/missed.txt 2>/dev/null || true
             exit 1
           else
             echo "✅ Mutation score meets 80% threshold"

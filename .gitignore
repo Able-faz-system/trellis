@@ -24,3 +24,8 @@ frontend/.env.*.local
 # Cargo.lock is tracked for the CLI binary crate to ensure reproducible builds.
 # Unlike libraries, binary crates should commit their lockfile so that every
 # developer and CI runner resolves identical dependency versions.
+
+# cargo-mutants output
+mutants.out/
+mutants.out.old/
+mutants-out/

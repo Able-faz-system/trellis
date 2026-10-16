@@ -140,7 +140,8 @@ test:
       if: github.event.schedule == '0 0 * * 0'  # Sundays only
       run: |
         cargo install --locked cargo-mutants
-        cargo mutants --output mutants.json
+        # --output names a directory; results land in mutants-out/mutants.out/outcomes.json
+        cargo mutants --output mutants-out
     
     # Gas regression check
     - name: Check gas costs
