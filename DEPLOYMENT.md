@@ -133,6 +133,17 @@ trellis init \
 trellis status --agreement-id <hex>
 ```
 
+### Check an agreement's total value
+
+```bash
+trellis total-amount --agreement-id <hex>
+```
+
+> Read-only; no signature or confirmation needed. Returns the sum of all
+> milestone amounts (an `i128` in the token's base unit, printed as a quoted
+> string). The frontend's agreement status page shows the same value as
+> **Total** in the Milestones header.
+
 ### Fund a milestone
 
 ```bash
@@ -287,6 +298,7 @@ does not already exist.
 |---|---|---|
 | `init` | ✅ Verified on testnet | Agreement created on-chain |
 | `status` | ✅ Verified on testnet | Returns full agreement state as JSON |
+| `total-amount` | ✅ Implemented | Returns the agreement's total value via `get_total_amount` (Issue #492) |
 | `lock-funds` | ✅ Verified on testnet | Funds successfully locked in escrow (Issue #7) |
 | `submit-work` | ✅ Verified on testnet | Work proof submitted and milestone transitioned to WorkSubmitted (Issue #8) |
 | `approve-release` | ✅ Verified on testnet | Funds released to payee, milestone marked Completed (Issue #8) |

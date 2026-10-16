@@ -197,6 +197,13 @@ pub enum Commands {
         agreement_id: String,
     },
 
+    /// Query an agreement's total value (sum of all milestone amounts).
+    TotalAmount {
+        /// Agreement ID (hex-encoded, 64 chars).
+        #[arg(long)]
+        agreement_id: String,
+    },
+
     /// Query the current status of a single milestone (cheaper than fetching the full agreement).
     MilestoneStatus {
         /// Agreement ID (hex-encoded, 64 chars).
@@ -352,6 +359,8 @@ pub fn dispatch(cmd: Commands, config: &Config, opts: &OutputOpts) -> Result<(),
         } => run_cancel_milestone(config, agreement_id, milestone_id, yes, opts),
 
         Commands::Status { agreement_id } => run_status(config, agreement_id, opts),
+
+        Commands::TotalAmount { agreement_id } => run_total_amount(config, agreement_id, opts),
 
         Commands::MilestoneStatus {
             agreement_id,
@@ -791,6 +800,29 @@ fn run_status(config: &Config, agreement_id: String, opts: &OutputOpts) -> Resul
     let args = vec!["--agreement-id".to_string(), agreement_id];
 
     execute(config, "get_agreement", &args, opts)
+}
+
+/// `stellar contract invoke … -- get_total_amount …`
+///
+/// Final call signature:
+/// ```
+/// stellar contract invoke … -- get_total_amount
+///   --agreement-id <hex>
+/// ```
+///
+/// Read-only view returning the agreement's pre-computed `total_amount`
+/// (an `i128`, printed by the stellar CLI as a quoted decimal string). No
+/// confirmation prompt — nothing is mutated.
+fn run_total_amount(
+    config: &Config,
+    agreement_id: String,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
+
+    let args = vec!["--agreement-id".to_string(), agreement_id];
+
+    execute(config, "get_total_amount", &args, opts)
 }
 
 /// `stellar contract invoke … -- get_milestone …`
@@ -1390,6 +1422,68 @@ mod tests {
         // Replace one char with null byte representation
         id = id.replacen('a', "\0", 1);
         assert!(validate_agreement_id(&id).is_err());
+    }
+
+    // --- total-amount command (#492) ---
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[test]
+    fn total_amount_parses_from_argv() {
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        let cli =
+            TestCli::try_parse_from(["trellis", "total-amount", "--agreement-id", &id]).unwrap();
+        match cli.command {
+            Commands::TotalAmount { agreement_id } => assert_eq!(agreement_id, id),
+            other => panic!("parsed into the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_amount_requires_agreement_id() {
+        use clap::Parser;
+
+        assert!(TestCli::try_parse_from(["trellis", "total-amount"]).is_err());
+    }
+
+    #[test]
+    fn total_amount_takes_no_confirmation_flag() {
+        // Read-only views must not grow a --yes flag: it would imply a
+        // state change that never happens.
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        assert!(
+            TestCli::try_parse_from(["trellis", "total-amount", "--agreement-id", &id, "--yes"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn status_still_parses_alongside_total_amount() {
+        // Adjacent regression guard: the new command must not disturb the
+        // existing `status` view it is modelled on.
+        use clap::Parser;
+
+        let id = "b".repeat(64);
+        let cli = TestCli::try_parse_from(["trellis", "status", "--agreement-id", &id]).unwrap();
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    #[test]
+    fn json_envelope_total_amount_result_is_quoted_i128() {
+        // The stellar CLI prints an i128 return value as a JSON string so it
+        // never loses precision; the envelope must carry it through verbatim.
+        let big = i128::MAX.to_string();
+        let env = json_envelope(&ok_output(&format!("\"{big}\"")));
+        assert_eq!(env["status"], "success");
+        assert_eq!(env["result"], big);
     }
 
     // --- validate_proof_uri ---
