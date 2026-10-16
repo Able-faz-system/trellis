@@ -196,6 +196,17 @@ trellis cancel-milestone --agreement-id <hex> --milestone-id 0
 
 > Must be signed by the payer. Only works on milestones still in `Pending` status.
 
+### Extend an agreement's ledger TTL
+
+```bash
+trellis extend-ttl --agreement-id <hex> --caller <your G... address>
+```
+
+> Any address may call this — no party signature is required — but the source
+> account pays the rent. `--caller` is recorded in the `ttl_extended` event;
+> pass the source key's public address. Prompts for confirmation unless
+> `--yes` is given.
+
 ---
 
 ## Testnet Token (USDC)
@@ -281,6 +292,60 @@ does not already exist.
 
 ---
 
+## Agreement TTL Keeper
+
+Soroban archives persistent entries whose TTL runs out. Every state-mutating
+call renews an agreement's TTL to ~30 days, but an agreement that sits idle
+longer than that (a long delivery window, a stalled dispute) needs
+`extend_agreement_ttl` called on it. The repo ships a minimal keeper for this:
+
+- [`scripts/ttl-keeper.sh`](scripts/ttl-keeper.sh) runs
+  `trellis extend-ttl --yes` for every agreement listed in
+  [`.github/keeper-agreements.txt`](.github/keeper-agreements.txt) (or in
+  `TRELLIS_KEEPER_AGREEMENT_IDS`, comma-separated, when set). It attempts every
+  agreement and exits non-zero if any failed.
+- [`.github/workflows/ttl-keeper.yml`](.github/workflows/ttl-keeper.yml) runs
+  the script weekly (Wednesdays 05:00 UTC) and on manual dispatch, where an
+  `agreement_ids` input can override the file for a one-off run. The run's
+  output is written to the job summary.
+
+**Setup (maintainers).** The workflow is skipped until these are configured
+in the repository settings:
+
+| Name | Kind | Value |
+|---|---|---|
+| `TRELLIS_KEEPER_SECRET_KEY` | Secret | `S…` secret key of a funded testnet account that pays the rent |
+| `TRELLIS_KEEPER_ADDRESS` | Variable | The matching `G…` public address (recorded as `caller`) |
+| `TRELLIS_CONTRACT_ID` | Variable (optional) | Contract to target; defaults to the [Live Contract](#live-contract) |
+
+Use a dedicated low-balance account — never a payer, payee or resolver key.
+
+**Running it locally / as a cron job:**
+
+```bash
+export TRELLIS_CONTRACT_ID="<contract ID>"
+export TRELLIS_SOURCE_KEY="<funded identity name>"
+export TRELLIS_KEEPER_CALLER="$(stellar keys address <funded identity name>)"
+TRELLIS_BIN=target/release/trellis ./scripts/ttl-keeper.sh
+```
+
+**Assumptions and limitations.** This is a stopgap, not a production keeper
+network:
+
+- It only renews agreements someone has added to the tracked list — there is
+  no on-chain discovery, so new long-lived agreements must be added by PR.
+- It depends on GitHub's scheduler (runs can be delayed, and scheduled
+  workflows are disabled after 60 days without repository activity) and on a
+  single funded key. If that key runs out of XLM, every extension fails.
+- A failed run is visible only as a failed workflow run; nothing pages anyone.
+  The weekly cadence leaves roughly three missed runs of headroom before a
+  30-day TTL lapses.
+- After a [Testnet Reset](#testnet-reset) the listed IDs no longer exist and
+  every extension fails with `agreement not found` until the list (and
+  `TRELLIS_CONTRACT_ID`) is updated.
+
+---
+
 ## Verified CLI Commands
 
 | Command | Status | Notes |
@@ -293,6 +358,7 @@ does not already exist.
 | `raise-dispute` | ✅ Verified on testnet | Dispute raised and milestone transitioned to Disputed (Issue #9) |
 | `resolve-dispute` | ✅ Verified on testnet (both paths) | Resolves to both Refunded (payer) and Completed (payee) states (Issue #9) |
 | `cancel-milestone` | ✅ Implemented | Cancels unfunded milestones |
+| `extend-ttl` | ✅ Implemented | Renews an agreement's ledger TTL; used by the TTL keeper (Issue #494) |
 
 ---
 

@@ -488,7 +488,7 @@ Trellis is a monorepo with three layers:
 <details>
 <summary>📦 <strong>Storage Lifetime</strong></summary>
 <br />
-Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent.
+Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent. Use <code>trellis extend-ttl</code> for a one-off renewal; the scheduled TTL keeper described in <a href="./DEPLOYMENT.md#agreement-ttl-keeper">DEPLOYMENT.md</a> renews tracked agreements weekly.
 </details>
 
 ### Tech Stack
@@ -616,7 +616,7 @@ trellis status --agreement-id <hex-id>
 trellis lock-funds --agreement-id <hex-id> --milestone-id 0
 ```
 
-All **8 CLI commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, and `status`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
+All **9 CLI commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, `extend-ttl`, and `status`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
 
 #### Global Output Flags
 
