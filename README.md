@@ -569,6 +569,24 @@ npm run dev
 
 Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, live contract activity stats (agreements created / milestones locked, within the RPC event retention window), and full agreement management UI.
 
+### 📡 Run the event indexer (optional)
+
+By default each browser tab polls Soroban RPC for events, and history older
+than the RPC node's retention window (~7 days) is lost. The indexer in
+[`indexer/`](indexer/README.md) stores every contract event in SQLite and
+pushes updates to the frontend over SSE:
+
+```bash
+cd indexer
+RPC_URL=https://soroban-testnet.stellar.org \
+CONTRACT_ID=CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q \
+npm start
+```
+
+Then set `VITE_INDEXER_URL=http://localhost:8787` in `frontend/.env`. See
+[DEPLOYMENT.md](DEPLOYMENT.md#event-indexer--real-time-relay) for production
+setup and the data-retention model.
+
 ### 🛠️ Build and test the contract
 
 ```bash
@@ -642,6 +660,8 @@ export STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 export TRELLIS_CONTRACT_ID="CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q"
 export TRELLIS_SOURCE_KEY="<your stellar identity name>"
+# Or, for a raw S… secret, keep it in a 0600 file instead of the environment:
+# export TRELLIS_SOURCE_KEY_FILE=~/.trellis.key   (or pass --source-key-file)
 
 # Create a new agreement
 trellis init \
@@ -722,6 +742,57 @@ encoded to Soroban `ScVal` natively by the CLI, matching the contract's
 
 `--json` takes priority over `--human-readable` when both are passed.
 
+`--source-key-file <PATH>` (or `TRELLIS_SOURCE_KEY_FILE`) reads the signing key
+from a file and takes precedence over `TRELLIS_SOURCE_KEY`. See
+[DEPLOYMENT.md](./DEPLOYMENT.md#keeping-a-raw-secret-key-out-of-the-environment)
+for details.
+
+`--as payer|payee|resolver` signs with that role's key from
+`TRELLIS_PAYER_KEY` / `TRELLIS_PAYEE_KEY` / `TRELLIS_RESOLVER_KEY` (or the
+matching `*_KEY_FILE` variables). Keep all three in `.env` instead of
+re-exporting `TRELLIS_SOURCE_KEY` between commands:
+
+```bash
+trellis --as payee submit-work --agreement-id <hex-id> --milestone-id 0
+```
+
+#### Inspecting the Resolved Configuration
+
+`trellis config` prints the configuration the CLI actually resolved from
+flags, env vars and `.env`, without making any RPC call. It shows the network
+preset, RPC URL, passphrase, contract ID, the source key and where it came
+from, and whether the `stellar` binary is on `PATH`:
+
+```bash
+trellis config                       # key: value lines
+trellis config --human-readable      # colorized
+trellis config --json                # {"status", "result": {...}, ...}
+trellis --network futurenet config   # preview another preset
+```
+
+A raw `S…` secret seed is never printed. It is masked as `S...***`. Named
+`stellar keys` identities (e.g. `alice`) are not secret and are shown in
+full. The command exits `1` and lists the problems if any other command would
+reject this configuration, so it also works as a preflight check in scripts.
+
+#### Agreement History
+
+Every successful `init`, `status` and `milestone-status` call records the
+agreement ID (with its contract ID and a timestamp) in
+`~/.trellis/history.json`, so you don't have to keep track of 64-char hex IDs
+yourself:
+
+```bash
+trellis history              # table, most recent first
+trellis history --limit 5
+trellis history --json       # {"status": "success", "result": [ ... ], ...}
+trellis history --clear      # delete the cache
+```
+
+`--dry-run` calls are not recorded. Only public on-chain identifiers are
+stored, never keys. Set `TRELLIS_HISTORY_FILE` to use a different file, or
+`TRELLIS_NO_HISTORY=1` to turn recording off. If the cache can't be written,
+the CLI prints a warning but the command itself still succeeds.
 #### Network Passphrase Verification
 
 Before any command runs, the CLI calls the configured RPC endpoint's `getNetwork`
@@ -730,6 +801,39 @@ method and compares the returned `passphrase` against `--network-passphrase`
 an error naming both values, so a mismatched `--rpc-url` (e.g. mainnet RPC with a
 testnet passphrase) is caught immediately instead of surfacing as a confusing
 downstream failure. This check is skipped under `--dry-run`.
+
+#### Loading Configuration From a Specific File
+
+By default the CLI loads a `.env` file from the current directory (or the
+nearest ancestor). To switch between identities/environments without `cd`-ing
+or re-exporting variables, point it at an explicit file instead:
+
+```bash
+trellis status --agreement-id <hex-id> --env-file ~/trellis/payer.env
+
+# or, for every command in the shell session
+export TRELLIS_ENV_FILE=~/trellis/payer.env
+```
+
+`--env-file` overrides `TRELLIS_ENV_FILE`. When either is set, CWD discovery
+is skipped and a missing or unreadable file is an error. Exported environment
+variables and CLI flags still take priority over values in the file.
+
+#### Verbose RPC Tracing
+
+Use `-v` / `--verbose` (repeatable) to debug RPC retry behavior. Traces go to
+stderr, so `--json` output on stdout stays parseable:
+
+```bash
+# Each attempt's outcome, raw exit code, full error output, and why retrying stopped
+trellis status --agreement-id <hex-id> -v
+
+# Also the full `stellar contract invoke` command and per-attempt timing
+trellis status --agreement-id <hex-id> -vv
+```
+
+Raw `S…` secret seeds are always shown as `STELLAR_SECRET_KEY=<redacted>`.
+`--quiet` overrides `--verbose`.
 
 #### Shell Completions
 

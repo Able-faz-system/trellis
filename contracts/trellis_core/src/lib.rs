@@ -895,6 +895,16 @@ impl TrellisContract {
             return Ok(0);
         }
 
+        // An empty batch funds nothing, so there is no state change to persist.
+        // Returning here skips the `write_agreement` below, which would
+        // otherwise rewrite the agreement byte-for-byte identically — a
+        // redundant persistent write that costs the caller gas and extends the
+        // entry's TTL while changing nothing observable.
+        if milestone_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let token = token::Client::new(&env, &agreement.token);
         let token = token::Client::new(&env, &header.token);
         let mut funded: u32 = 0;
 

@@ -55,6 +55,16 @@ export function getNetworkPassphrase(): string {
 }
 
 /**
+ * Base URL of the optional Trellis indexer/relay service (see indexer/ and
+ * DEPLOYMENT.md). Unlike the variables above this one is optional: when it is
+ * unset the event hooks poll Soroban RPC directly, exactly as before.
+ */
+export function getIndexerUrl(): string | null {
+  const value = import.meta.env.VITE_INDEXER_URL
+  return typeof value === 'string' && value ? value.replace(/\/+$/, '') : null
+}
+
+/**
  * Named re-exports kept for backwards compatibility with existing consumers.
  * The module-level constants are now derived via the lazy getters, so they
  * are still evaluated lazily on the first import rather than unconditionally
