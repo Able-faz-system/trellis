@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod history;
 mod input;
 mod keystore;
 mod rpc;
@@ -13,8 +14,7 @@ mod sdk_compat;
 
 use clap::{ArgAction, CommandFactory, Parser};
 use commands::{Commands, OutputFormat, OutputOpts};
-use config::Network;
-use std::path::{Path, PathBuf};
+use config::{Network, Role};
 use std::process;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,12 @@ use std::process;
 /// Required variables:
 ///   TRELLIS_CONTRACT_ID        — Bech32 contract address (`C…`)
 ///   TRELLIS_SOURCE_KEY         — Stellar secret key or named identity
+///                                (or TRELLIS_SOURCE_KEY_FILE / --source-key-file,
+///                                which take precedence)
+///
+/// Per-role identities, selected with `--as payer|payee|resolver`:
+///   TRELLIS_PAYER_KEY / TRELLIS_PAYEE_KEY / TRELLIS_RESOLVER_KEY
+///   (or the matching *_KEY_FILE variables)
 ///
 /// Optional variables (Soroban Testnet used as default):
 ///   STELLAR_RPC_URL            — Soroban JSON-RPC endpoint
@@ -79,16 +85,23 @@ struct Cli {
     /// Read the source key from this file instead of the `TRELLIS_SOURCE_KEY`
     /// environment variable. Preferred for raw `S…` secret seeds: file
     /// contents never appear in `ps` / `/proc` the way an argv or exported
-    /// env var can (#240). Overrides `TRELLIS_SOURCE_KEY_FILE`.
+    /// env var can (#240). Precedence: this flag > `TRELLIS_SOURCE_KEY_FILE`
+    /// > `TRELLIS_SOURCE_KEY`. Warns if the file is group/world-accessible.
     #[arg(long, global = true, value_name = "PATH")]
     source_key_file: Option<String>,
 
-    /// Load configuration from this env file instead of discovering `.env`
-    /// in the working directory (and its ancestors). Overrides
-    /// `TRELLIS_ENV_FILE`. Exported env vars still take priority over values
-    /// in the file. A missing or unreadable file is an error.
-    #[arg(long, global = true, value_name = "PATH")]
-    env_file: Option<PathBuf>,
+    /// Sign as this escrow role, using its own key from `TRELLIS_PAYER_KEY`,
+    /// `TRELLIS_PAYEE_KEY` or `TRELLIS_RESOLVER_KEY` (or the matching
+    /// `*_KEY_FILE` variable, which takes precedence) instead of
+    /// `TRELLIS_SOURCE_KEY`. Fails if the role's key is not configured.
+    #[arg(
+        long = "as",
+        global = true,
+        value_enum,
+        value_name = "ROLE",
+        conflicts_with = "source_key_file"
+    )]
+    as_role: Option<Role>,
 
     #[command(subcommand)]
     command: Commands,
@@ -253,6 +266,25 @@ fn validate_environment() -> Result<(), String> {
     Ok(())
 }
 
+/// Build the output options from the global flags.
+///
+/// #77/#74: `--json` takes priority over `--human-readable`; `--quiet`
+/// forces the JSON envelope so the only stdout line is the result.
+fn output_opts(cli: &Cli) -> OutputOpts {
+    let format = if cli.json || cli.quiet {
+        OutputFormat::Json
+    } else if cli.human_readable {
+        OutputFormat::Human
+    } else {
+        OutputFormat::Raw
+    };
+    OutputOpts {
+        format,
+        quiet: cli.quiet,
+        dry_run: cli.dry_run,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -280,6 +312,15 @@ fn main() {
         return;
     }
 
+    // ── #484: `trellis history` only reads a local file, so it needs neither
+    // the stellar binary nor a valid contract/key configuration. ─────────
+    if let Commands::History { limit, clear } = cli.command {
+        let path = history::default_path();
+        if let Err(msg) = commands::run_history(path.as_deref(), limit, clear, &output_opts(&cli)) {
+            eprintln!("{msg}");
+            process::exit(1);
+        }
+        return;
     // ── #406: Skip stellar-binary check for --dry-run ─────────────────────
     // --dry-run only prints the command that would run; it never spawns the
     // stellar binary itself.  Requiring the binary here blocks a legitimate
@@ -305,6 +346,7 @@ fn main() {
         cli.rpc_url.clone(),
         cli.network_passphrase.clone(),
         cli.source_key_file.clone(),
+        cli.as_role,
     ) {
         Ok(c) => c,
         Err(msg) => {
@@ -312,6 +354,24 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // ── #485: `trellis config` reports the resolved configuration, including
+    // a missing `stellar` binary or invalid values, instead of exiting on
+    // them like the checks below do. ──────────────────────────────────────
+    if let Commands::Config = cli.command {
+        let opts = output_opts(&cli);
+        let stellar_found = validate_environment().is_ok();
+        if commands::run_config(cli.network, &config, stellar_found, &opts).is_err() {
+            process::exit(1);
+        }
+        return;
+    }
+
+    // ── #68: Validate stellar binary at startup ────────────────────────────
+    if let Err(msg) = validate_environment() {
+        eprintln!("{msg}");
+        process::exit(1);
+    }
 
     // ── #236/#237: Reject a malformed contract ID or RPC URL up front with
     // a clear message instead of a cryptic failure deep in the Stellar CLI. ─
@@ -327,7 +387,7 @@ fn main() {
         }
         eprintln!(
             "\nSet the required environment variables (TRELLIS_CONTRACT_ID, \
-             TRELLIS_SOURCE_KEY) or pass the matching CLI flags."
+             TRELLIS_SOURCE_KEY or TRELLIS_SOURCE_KEY_FILE) or pass the matching CLI flags."
         );
         process::exit(1);
     }
@@ -345,22 +405,7 @@ fn main() {
         }
     }
 
-    // ── #77/#74: --json takes priority over --human-readable; --quiet
-    // forces the JSON envelope so the only stdout line is the result. ──────
-    let format = if cli.json || cli.quiet {
-        OutputFormat::Json
-    } else if cli.human_readable {
-        OutputFormat::Human
-    } else {
-        OutputFormat::Raw
-    };
-    let opts = OutputOpts {
-        format,
-        quiet: cli.quiet,
-        dry_run: cli.dry_run,
-        // --quiet promises nothing but the final JSON result, so it wins.
-        verbose: if cli.quiet { 0 } else { cli.verbose },
-    };
+    let opts = output_opts(&cli);
 
     // ── #67: Propagate errors from dispatch; exit(1) only in main ─────────
     // All cleanup (destructors, buffer flushes) runs before the exit call
