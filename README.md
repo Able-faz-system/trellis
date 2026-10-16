@@ -614,9 +614,12 @@ trellis status --agreement-id <hex-id>
 
 # Fund the first milestone
 trellis lock-funds --agreement-id <hex-id> --milestone-id 0
+
+# Fund several milestones atomically in one transaction
+trellis batch-lock-funds --agreement-id <hex-id> --milestone-ids "0,1,2"
 ```
 
-All **8 CLI commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, and `status`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
+All **9 CLI commands** are implemented — `init`, `lock-funds`, `batch-lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, and `status`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
 
 #### Global Output Flags
 

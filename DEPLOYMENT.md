@@ -141,6 +141,18 @@ trellis lock-funds --agreement-id <hex> --milestone-id 0
 
 > Must be signed by the payer identity (`TRELLIS_SOURCE_KEY=trellis-payer`)
 
+### Fund several milestones at once
+
+```bash
+trellis batch-lock-funds --agreement-id <hex> --milestone-ids "0,1,2"
+```
+
+> Must be signed by the payer identity. The batch is atomic: if any listed
+> milestone is out of range or not `Pending`, the whole transaction reverts and
+> no tokens move. `--milestone-ids` takes comma-separated zero-based indices;
+> empty input, empty fields (`"0,,1"`), non-integers and duplicate IDs are
+> rejected by the CLI before anything is submitted.
+
 ### Submit work proof
 
 ```bash
@@ -288,6 +300,7 @@ does not already exist.
 | `init` | ✅ Verified on testnet | Agreement created on-chain |
 | `status` | ✅ Verified on testnet | Returns full agreement state as JSON |
 | `lock-funds` | ✅ Verified on testnet | Funds successfully locked in escrow (Issue #7) |
+| `batch-lock-funds` | ✅ Implemented | Atomically funds multiple milestones in one transaction (Issue #493) |
 | `submit-work` | ✅ Verified on testnet | Work proof submitted and milestone transitioned to WorkSubmitted (Issue #8) |
 | `approve-release` | ✅ Verified on testnet | Funds released to payee, milestone marked Completed (Issue #8) |
 | `raise-dispute` | ✅ Verified on testnet | Dispute raised and milestone transitioned to Disputed (Issue #9) |
