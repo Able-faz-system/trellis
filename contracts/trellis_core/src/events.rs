@@ -30,6 +30,7 @@ use soroban_sdk::{symbol_short, Address, BytesN, Env, String};
 //  10. "trls_cmpl"  ( 9 chars) → symbol_short! — agreement_completed (abbreviated)
 //  11. "trls_ddln"  ( 9 chars) → symbol_short! — deadline_set       (abbreviated)
 //  12. "trls_expd"  ( 9 chars) → symbol_short! — milestone_expired  (abbreviated)
+//  13. "trls_rrot"  ( 9 chars) → symbol_short! — resolver_rotated   (abbreviated)
 //
 // All abbreviations follow the pattern: drop the vowels from the root word
 // while keeping enough consonants to be unambiguous.  They are intentional
@@ -48,6 +49,7 @@ use soroban_sdk::{symbol_short, Address, BytesN, Env, String};
 //  10. "agreement_completed" → (completed_count: u32, refunded_count: u32)
 //  11. "deadline_set" → (milestone_id: u32, deadline: u64)
 //  12. "expired"   → (milestone_id: u32, refunded_amount: i128, caller: Address)
+//  13. "resolver_rotated" → (old_resolver: Address, new_resolver: Address)
 //
 // Schema changes: the `amount` field on "disputed", "resolved" and
 // "cancelled" was appended as the last tuple element, so an indexer that
@@ -64,6 +66,13 @@ use soroban_sdk::{symbol_short, Address, BytesN, Env, String};
 // able to tell an arbitrated dispute outcome apart from a payer walking back a
 // milestone that was never funded, since only the former involves token
 // movement and resolver involvement.
+//
+// "trls_rrot" is the only event that carries two `Address` values describing
+// the same role before and after a state change. An indexer must treat
+// `old_resolver` as the address that could sign `resolve_dispute` *before* this
+// event and `new_resolver` as the one that can sign it *after*, so the pair is
+// the authoritative resolver-history record for an agreement — `get_agreement`
+// only ever exposes the current holder.
 // ---------------------------------------------------------------------------
 
 /// Emitted when a new escrow agreement is created.
@@ -307,5 +316,29 @@ pub fn milestone_expired(
     env.events().publish(
         (symbol_short!("trls_expd"), agreement_id.clone()),
         (milestone_id, refunded_amount, caller),
+    );
+}
+
+/// Emitted when an agreement's dispute resolver is replaced.
+///
+/// Topics: `("trls_rrot", agreement_id)`
+/// Data:   `(old_resolver, new_resolver)`
+///
+/// Both addresses are recorded, not just the new one: `get_agreement` only ever
+/// exposes the current resolver, so without this event an indexer could not
+/// reconstruct who was able to rule on a dispute that was raised before the
+/// rotation. No tokens move and no milestone changes status — the only effect
+/// is that `resolve_dispute` / `resolve_dispute_split` now gate on
+/// `new_resolver` instead of `old_resolver`, including for milestones that are
+/// already `Disputed`.
+pub fn resolver_rotated(
+    env: &Env,
+    agreement_id: BytesN<32>,
+    old_resolver: Address,
+    new_resolver: Address,
+) {
+    env.events().publish(
+        (symbol_short!("trls_rrot"), agreement_id.clone()),
+        (old_resolver, new_resolver),
     );
 }

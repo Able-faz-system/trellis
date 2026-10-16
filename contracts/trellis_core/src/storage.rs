@@ -172,10 +172,11 @@ pub fn read_header(env: &Env, id: &BytesN<32>) -> Result<AgreementHeader, Trelli
 /// Persist an updated [`AgreementHeader`] — one ledger write.
 ///
 /// Only [`crate::lib`] uses this, and only when it has to change
-/// agreement-level data: today that is `release_partial` recording a
-/// cumulative release in `released_amounts`. Milestone status transitions
-/// never call it — they go through [`write_milestone`] — which is what keeps
-/// them to a single ledger write (#401).
+/// agreement-level data: `release_partial` recording a cumulative release in
+/// `released_amounts`, and `rotate_resolver` replacing `dispute_resolver`.
+/// Milestone status transitions never call it — they go through
+/// [`write_milestone`] — which is what keeps them to a single ledger write
+/// (#401).
 pub fn write_header(env: &Env, id: &BytesN<32>, header: &AgreementHeader) {
     let key = DataKey::Agreement(id.clone());
     env.storage().persistent().set(&key, header);
