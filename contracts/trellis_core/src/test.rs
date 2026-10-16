@@ -6,7 +6,7 @@ use soroban_sdk::{
 
 use crate::{
     errors::TrellisError,
-    test_utils::{agreement_id, one_milestone},
+    test_utils::{agreement_id, milestones_from_amounts, one_milestone},
     types::{EscrowStatus, Milestone},
     TrellisContract, TrellisContractClient, MAX_PROOF_URI_LEN,
 };
@@ -3216,5 +3216,128 @@ fn test_rotate_resolver_preserves_escrow_and_release_state() {
         token_client.balance(&payer),
         10_000 - 500,
         "rotation must not move the payer's remaining balance"
+    );
+}
+
+/// #612: happy path for `release_partial`. Two partial releases — one while
+/// the milestone is `Funded`, one after the work is submitted — must each move
+/// exactly `amount` from the contract to the payee, return the remainder,
+/// leave the milestone in its current non-terminal status, record the
+/// cumulative release in `released_amounts`, and emit a single `trls_prtl`
+/// event carrying `(milestone_id, amount, remaining)`.
+#[test]
+fn test_release_partial_happy_path() {
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+    let id = agreement_id(&env, 136);
+
+    client.init(
+        &id,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones_from_amounts(&env, &[1_000, 400]),
+        &dispute_resolver,
+    );
+    client.lock_funds(&id, &0u32);
+
+    assert_eq!(token_client.balance(&payer), 9_000);
+    assert_eq!(token_client.balance(&client.address), 1_000);
+    assert_eq!(token_client.balance(&payee), 0);
+
+    // --- First partial release, milestone still `Funded` -------------------
+    let remaining = client.release_partial(&id, &0u32, &300i128);
+
+    // Events must be checked straight after the call (see `assert_trellis_topics`).
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_prtl")],
+        "a non-final partial release must emit exactly one trls_prtl event",
+    );
+    let (event_milestone, event_amount, event_remaining): (u32, i128, i128) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_prtl"));
+    assert_eq!(event_milestone, 0, "trls_prtl must name the released milestone");
+    assert_eq!(event_amount, 300, "trls_prtl must carry the released amount");
+    assert_eq!(event_remaining, 700, "trls_prtl must carry the remainder");
+
+    assert_eq!(remaining, 700, "release_partial must return the remainder");
+    assert_eq!(
+        token_client.balance(&client.address),
+        700,
+        "the contract must be debited exactly the released amount"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        300,
+        "the payee must be credited exactly the released amount"
+    );
+    assert_eq!(
+        token_client.balance(&payer),
+        9_000,
+        "a partial release must not touch the payer's balance"
+    );
+
+    let agreement = client.get_agreement(&id);
+    assert_eq!(
+        agreement.milestones.get(0).expect("milestone 0 must exist").status,
+        EscrowStatus::Funded,
+        "a partially released milestone must stay Funded"
+    );
+    assert_eq!(
+        agreement.released_amounts.get(0),
+        Some(300),
+        "released_amounts must record the first release"
+    );
+    assert_eq!(
+        agreement.released_amounts.get(1),
+        None,
+        "an untouched milestone must have no release entry"
+    );
+
+    // --- Second partial release, milestone now `WorkSubmitted` -------------
+    client.submit_work(&id, &0u32, &None);
+    let remaining = client.release_partial(&id, &0u32, &450i128);
+
+    assert_trellis_topics(
+        &env,
+        &client.address,
+        &[symbol_short!("trls_prtl")],
+        "a non-final partial release must emit exactly one trls_prtl event",
+    );
+    let (event_milestone, event_amount, event_remaining): (u32, i128, i128) =
+        trellis_event_data(&env, &client.address, symbol_short!("trls_prtl"));
+    assert_eq!(event_milestone, 0, "trls_prtl must name the released milestone");
+    assert_eq!(event_amount, 450, "trls_prtl must carry the released amount");
+    assert_eq!(event_remaining, 250, "trls_prtl must carry the remainder");
+
+    assert_eq!(remaining, 250, "release_partial must return the remainder");
+    assert_eq!(
+        token_client.balance(&client.address),
+        250,
+        "the contract must be debited exactly the second released amount"
+    );
+    assert_eq!(
+        token_client.balance(&payee),
+        750,
+        "the payee must be credited the cumulative released amount"
+    );
+    assert_eq!(token_client.balance(&payer), 9_000);
+
+    let agreement = client.get_agreement(&id);
+    assert_eq!(
+        agreement.milestones.get(0).expect("milestone 0 must exist").status,
+        EscrowStatus::WorkSubmitted,
+        "a partially released milestone must keep its WorkSubmitted status"
+    );
+    assert_eq!(
+        agreement.milestones.get(1).expect("milestone 1 must exist").status,
+        EscrowStatus::Pending,
+        "a partial release must not affect other milestones"
+    );
+    assert_eq!(
+        agreement.released_amounts.get(0),
+        Some(750),
+        "released_amounts must hold the cumulative total of both releases"
     );
 }
