@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { addToHistory } from '../lib/history'
 import { isValidHexAgreementId } from '../lib/agreementId'
 import { useAgreement } from '../hooks/useAgreement'
+import { useTotalAmount } from '../hooks/useTotalAmount'
 import AgreementDetail from '../components/AgreementDetail'
 import EventFeed from '../components/EventFeed'
 
@@ -13,6 +14,7 @@ function AgreementStatusPage() {
   const [validationError, setValidationError] = useState<string | null>(null)
 
   const { agreement, isLoading, isError, error, refetch } = useAgreement(queriedId)
+  const { totalAmount } = useTotalAmount(queriedId)
 
   // Viewing an agreement records it in the local history list.
   useEffect(() => {
@@ -91,7 +93,7 @@ function AgreementStatusPage() {
       {/* Agreement Data */}
       {agreement && !isLoading && (
         <div className="mt-10 space-y-6">
-          <AgreementDetail agreement={agreement} onUpdate={refetch} />
+          <AgreementDetail agreement={agreement} onUpdate={refetch} totalAmount={totalAmount} />
           <EventFeed agreementId={agreement.agreement_id} />
         </div>
       )}

@@ -21,11 +21,11 @@ const mockAgreement: Agreement = {
   created: '2024-01-01',
 }
 
-const renderAgreementDetail = (agreement: Agreement) => {
+const renderAgreementDetail = (agreement: Agreement, totalAmount?: string | null) => {
   return render(
     <ThemeProvider>
       <WalletProvider>
-        <AgreementDetail agreement={agreement} />
+        <AgreementDetail agreement={agreement} totalAmount={totalAmount} />
       </WalletProvider>
     </ThemeProvider>
   )
@@ -63,5 +63,35 @@ describe('<AgreementDetail />', () => {
     // Agreement ID should be displayed somewhere
     const agreementIdElement = screen.queryByText(mockAgreement.agreement_id.slice(0, 8))
     expect(agreementIdElement || screen.getByText(/agreement/i)).toBeInTheDocument()
+  })
+
+  // --- get_total_amount display (#492) ---
+
+  it('shows the on-chain total amount next to the milestone list', () => {
+    renderAgreementDetail(mockAgreement, '3500')
+
+    const total = screen.getByTestId('agreement-total-amount')
+    expect(total).toHaveTextContent('Total')
+    expect(total).toHaveTextContent('3500')
+  })
+
+  it('preserves i128 totals beyond Number.MAX_SAFE_INTEGER verbatim', () => {
+    const big = '170141183460469231731687303715884105727'
+    renderAgreementDetail(mockAgreement, big)
+
+    expect(screen.getByTestId('agreement-total-amount')).toHaveTextContent(big)
+  })
+
+  it('hides the total line while the total is unavailable', () => {
+    renderAgreementDetail(mockAgreement, null)
+    expect(screen.queryByTestId('agreement-total-amount')).not.toBeInTheDocument()
+  })
+
+  it('still renders milestone rows when no total is passed', () => {
+    // Adjacent regression guard: the total is optional, so existing callers
+    // that never pass it must keep rendering the milestone table unchanged.
+    renderAgreementDetail(mockAgreement)
+    expect(screen.queryByTestId('agreement-total-amount')).not.toBeInTheDocument()
+    expect(screen.getByText('1000')).toBeInTheDocument()
   })
 })
