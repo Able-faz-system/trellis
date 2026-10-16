@@ -6,9 +6,11 @@ import type { Agreement } from '../lib/soroban'
 interface AgreementDetailProps {
   agreement: Agreement
   onUpdate?: () => void
+  /** On-chain `get_total_amount` value; the total line is hidden while null. */
+  totalAmount?: string | null
 }
 
-export default function AgreementDetail({ agreement, onUpdate }: AgreementDetailProps) {
+export default function AgreementDetail({ agreement, onUpdate, totalAmount }: AgreementDetailProps) {
   return (
     <div className="space-y-6">
       {/* Agreement Header */}
@@ -57,8 +59,14 @@ export default function AgreementDetail({ agreement, onUpdate }: AgreementDetail
 
       {/* Milestones Table */}
       <div className="rounded-xl border border-navy-700 dark:border-navy-700 light:border-gray-200 bg-navy-800/60 dark:bg-navy-800/60 light:bg-gray-50 overflow-hidden">
-        <div className="p-6 border-b border-navy-700 dark:border-navy-700 light:border-gray-200">
+        <div className="p-6 border-b border-navy-700 dark:border-navy-700 light:border-gray-200 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-xl font-semibold text-white dark:text-white light:text-gray-900">Milestones</h2>
+          {totalAmount != null && (
+            <p className="text-sm text-gray-400 dark:text-gray-400 light:text-gray-600" data-testid="agreement-total-amount">
+              Total{' '}
+              <span className="font-mono text-white dark:text-white light:text-gray-900">{totalAmount}</span>
+            </p>
+          )}
         </div>
 
         <div className="overflow-x-auto">

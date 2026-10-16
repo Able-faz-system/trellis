@@ -502,6 +502,7 @@ The CLI builds Soroban <code>ScVal</code> arguments natively in Rust instead of 
 <details>
 <summary>📦 <strong>Storage Lifetime</strong></summary>
 <br />
+Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent. Use <code>trellis extend-ttl</code> for a one-off renewal; the scheduled TTL keeper described in <a href="./DEPLOYMENT.md#agreement-ttl-keeper">DEPLOYMENT.md</a> renews tracked agreements weekly.
 Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically, and the view functions (<code>get_agreement</code>, <code>get_milestone</code>, <code>get_total_amount</code>) renew it as well whenever a read finds the remaining TTL below the threshold — so a read is not strictly side-effect free, and the caller pays for the extension. Reading keeps a watched agreement alive between transitions rather than leaving it to expire. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent.
 </details>
 
@@ -674,13 +675,19 @@ trellis init \
 # Check status
 trellis status --agreement-id <hex-id>
 
+# Total value of all milestones
+trellis total-amount --agreement-id <hex-id>
 # Check a single milestone's status
 trellis milestone-status --agreement-id <hex-id> --milestone-id 0
 
 # Fund the first milestone
 trellis lock-funds --agreement-id <hex-id> --milestone-id 0
+
+# Fund several milestones atomically in one transaction
+trellis batch-lock-funds --agreement-id <hex-id> --milestone-ids "0,1,2"
 ```
 
+All **11 CLI commands** are implemented — `init`, `lock-funds`, `batch-lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, `extend-ttl`, `status`, and `total-amount`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
 All **9 escrow commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, `status`, and `milestone-status`. The CLI also provides two utility commands: `completion` (see [Shell Completions](#shell-completions)) and `keys` (manage secret keys in the OS keychain). See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
 
 `trellis health` checks the configured RPC endpoint natively (`getHealth` + `getLatestLedger` over HTTP). It needs only an RPC URL, with no `stellar` binary, contract ID or source key, and it supports `--json` / `--human-readable` / `--quiet` / `--dry-run`.

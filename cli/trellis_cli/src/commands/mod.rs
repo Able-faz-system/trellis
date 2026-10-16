@@ -206,6 +206,22 @@ pub enum Commands {
         yes: bool,
     },
 
+    /// Atomically lock funds for several milestones in one transaction.
+    BatchLockFunds {
+        /// Agreement ID (hex-encoded, 64 chars).
+        #[arg(long)]
+        agreement_id: String,
+
+        /// Comma-separated zero-based milestone indices to fund.
+        /// Example: --milestone-ids "0,1,2"
+        #[arg(long)]
+        milestone_ids: String,
+
+        /// Skip the confirmation prompt (for scripting).
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Submit proof of work for a funded milestone.
     SubmitWork {
         /// Agreement ID (hex-encoded, 64 chars).
@@ -296,8 +312,34 @@ pub enum Commands {
         yes: bool,
     },
 
+    /// Renew an agreement's ledger TTL so an idle agreement is not archived.
+    ///
+    /// Any address may call this; the source account pays the rent. Intended
+    /// for keepers (see `scripts/ttl-keeper.sh`).
+    ExtendTtl {
+        /// Agreement ID (hex-encoded, 64 chars).
+        #[arg(long)]
+        agreement_id: String,
+
+        /// Address recorded as the caller in the `ttl_extended` event —
+        /// normally the public address of the signing source key.
+        #[arg(long)]
+        caller: String,
+
+        /// Skip the confirmation prompt (for scripting).
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Query the current state of an agreement.
     Status {
+        /// Agreement ID (hex-encoded, 64 chars).
+        #[arg(long)]
+        agreement_id: String,
+    },
+
+    /// Query an agreement's total value (sum of all milestone amounts).
+    TotalAmount {
         /// Agreement ID (hex-encoded, 64 chars).
         #[arg(long)]
         agreement_id: String,
@@ -445,6 +487,12 @@ pub fn dispatch(cmd: Commands, config: &Config, opts: &OutputOpts) -> Result<(),
             yes,
         } => run_lock_funds(config, agreement_id, milestone_id, yes, opts),
 
+        Commands::BatchLockFunds {
+            agreement_id,
+            milestone_ids,
+            yes,
+        } => run_batch_lock_funds(config, agreement_id, milestone_ids, yes, opts),
+
         Commands::SubmitWork {
             agreement_id,
             milestone_id,
@@ -485,8 +533,15 @@ pub fn dispatch(cmd: Commands, config: &Config, opts: &OutputOpts) -> Result<(),
             yes,
         } => run_cancel_milestone(config, agreement_id, milestone_id, yes, opts),
 
+        Commands::ExtendTtl {
+            agreement_id,
+            caller,
+            yes,
+        } => run_extend_ttl(config, agreement_id, caller, yes, opts),
+
         Commands::Status { agreement_id } => run_status(config, agreement_id, opts),
 
+        Commands::TotalAmount { agreement_id } => run_total_amount(config, agreement_id, opts),
 
         Commands::MilestoneStatus {
             agreement_id,
@@ -748,6 +803,53 @@ fn run_lock_funds(
     execute(config, "lock_funds", &args, opts)
 }
 
+/// `stellar contract invoke … -- batch_lock_funds …`
+///
+/// Final call signature:
+/// ```
+/// stellar contract invoke … -- batch_lock_funds
+///   --agreement-id <hex> --milestone-ids <JSON array of u32>
+/// ```
+///
+/// The contract funds every listed milestone atomically: if any one is out of
+/// range or not `Pending`, the whole transaction reverts and no tokens move.
+fn run_batch_lock_funds(
+    config: &Config,
+    agreement_id: String,
+    milestone_ids_csv: String,
+    yes: bool,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
+
+    let args = build_batch_lock_funds_args(agreement_id.clone(), &milestone_ids_csv)
+        .unwrap_or_else(|e| fail_validation(&e));
+
+    confirm_action(
+        &format!(
+            "This will lock funds for milestones {} of agreement {agreement_id} in a single transaction.",
+            args[3]
+        ),
+        yes,
+        opts,
+    )?;
+
+    execute(config, "batch_lock_funds", &args, opts)
+}
+
+/// Build the `batch_lock_funds` argument list from a raw agreement ID and a
+/// comma-separated milestone-ID list. Split out from the handler so the final
+/// argument shape can be unit-tested without touching the network.
+fn build_batch_lock_funds_args(agreement_id: String, csv: &str) -> Result<Vec<String>, String> {
+    let ids_json = build_milestone_ids_json(csv)?;
+    Ok(vec![
+        "--agreement-id".to_string(),
+        agreement_id,
+        "--milestone-ids".to_string(),
+        ids_json,
+    ])
+}
+
 /// `stellar contract invoke … -- submit_work …`
 ///
 /// Final call signature:
@@ -944,6 +1046,47 @@ fn run_cancel_milestone(
     execute(config, "cancel_unfunded_milestone", &args, opts)
 }
 
+/// `stellar contract invoke … -- extend_agreement_ttl …`
+///
+/// Final call signature:
+/// ```
+/// stellar contract invoke … -- extend_agreement_ttl
+///   --agreement-id <hex> --caller <G|C>
+/// ```
+///
+/// The contract requires no auth — `caller` is only recorded in the
+/// `ttl_extended` event — but the call is still a fee-paying transaction, so
+/// it goes through the same confirmation prompt as other submitting commands.
+fn run_extend_ttl(
+    config: &Config,
+    agreement_id: String,
+    caller: String,
+    yes: bool,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
+    validate_address("caller", &caller).unwrap_or_else(|e| fail_validation(&e));
+
+    confirm_action(
+        &format!("This will extend the ledger TTL of agreement {agreement_id} (rent paid by the source account)."),
+        yes,
+        opts,
+    )?;
+
+    execute(config, "extend_agreement_ttl", &build_extend_ttl_args(agreement_id, caller), opts)
+}
+
+/// Argument list for `extend_agreement_ttl`, split out so its shape can be
+/// unit-tested without touching the network.
+fn build_extend_ttl_args(agreement_id: String, caller: String) -> Vec<String> {
+    vec![
+        "--agreement-id".to_string(),
+        agreement_id,
+        "--caller".to_string(),
+        caller,
+    ]
+}
+
 /// `stellar contract invoke … -- get_agreement …`
 ///
 /// Final call signature:
@@ -962,6 +1105,29 @@ fn run_status(config: &Config, agreement_id: String, opts: &OutputOpts) -> Resul
     execute(config, "get_agreement", &args, opts)?;
     record_history(config, &agreement_id, "status", opts);
     Ok(())
+}
+
+/// `stellar contract invoke … -- get_total_amount …`
+///
+/// Final call signature:
+/// ```
+/// stellar contract invoke … -- get_total_amount
+///   --agreement-id <hex>
+/// ```
+///
+/// Read-only view returning the agreement's pre-computed `total_amount`
+/// (an `i128`, printed by the stellar CLI as a quoted decimal string). No
+/// confirmation prompt — nothing is mutated.
+fn run_total_amount(
+    config: &Config,
+    agreement_id: String,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
+
+    let args = vec!["--agreement-id".to_string(), agreement_id];
+
+    execute(config, "get_total_amount", &args, opts)
 }
 
 /// `stellar contract invoke … -- get_milestone …`
@@ -1344,6 +1510,28 @@ fn build_milestones_json(csv: &str) -> Result<String, String> {
     Ok(format!("[{}]", entries.join(",")))
 }
 
+/// Convert a comma-separated milestone-index string like `"0,1,2"` into the
+/// JSON array format the `stellar` CLI accepts for a `Vec<u32>` argument
+/// (`"[0,1,2]"`).
+///
+/// Follows the same rules as [`build_milestones_json`]: surrounding
+/// whitespace is trimmed, and empty input or empty fields (leading, trailing
+/// or doubled commas) are rejected rather than silently dropped.
+///
+/// Additionally rejects:
+/// - Any field that is not a valid non-negative `u32` (negative numbers,
+///   non-numeric text, values above `u32::MAX`).
+/// - Duplicate indices. The contract would revert the whole batch with
+///   `InvalidStateTransition` on the second occurrence (the milestone is
+///   already `Funded` by then), so this is caught early with a clearer message.
+///
+/// An empty batch is a valid no-op on-chain, but at the CLI it can only be a
+/// typo, so it is refused instead of spending a transaction fee on nothing.
+fn build_milestone_ids_json(csv: &str) -> Result<String, String> {
+    if csv.trim().is_empty() {
+        return Err(
+            "no milestone IDs provided — pass a comma-separated list of zero-based \
+             milestone indices, e.g. --milestone-ids \"0,1,2\""
 /// Build the full `Vec<Milestone>` argument as a native `ScVal` for the
 /// contract's `init` entry point.
 ///
@@ -1369,11 +1557,31 @@ fn build_milestones_scval(csv: &str) -> Result<soroban_sdk::xdr::ScVal, String> 
         );
     }
 
+    let mut ids: Vec<u32> = Vec::new();
     let mut milestones: Vec<ScVal> = Vec::new();
     for (idx, part) in csv.split(',').enumerate() {
         let trimmed = part.trim();
         if trimmed.is_empty() {
             return Err(format!(
+                "empty milestone ID at index {idx} — remove the leading, trailing, \
+                 or doubled comma in \"{csv}\" (expected e.g. \"0,1,2\")"
+            ));
+        }
+        let id: u32 = trimmed.parse().map_err(|_| {
+            format!(
+                "invalid milestone ID {trimmed:?} at index {idx} — expected a non-negative integer"
+            )
+        })?;
+        if ids.contains(&id) {
+            return Err(format!(
+                "duplicate milestone ID {id} at index {idx} — each milestone can only be funded once"
+            ));
+        }
+        ids.push(id);
+    }
+
+    let joined: Vec<String> = ids.iter().map(u32::to_string).collect();
+    Ok(format!("[{}]", joined.join(",")))
                 "empty milestone amount at index {idx} — remove the leading, trailing, \
                  or doubled comma in \"{csv}\" (expected e.g. \"1000,2000,500\")"
             ));
@@ -1864,6 +2072,153 @@ mod tests {
         );
     }
 
+    // --- build_milestone_ids_json / batch-lock-funds (#493) ---
+
+    #[test]
+    fn test_build_milestone_ids_json_happy_path() {
+        assert_eq!(build_milestone_ids_json("0,1,2").unwrap(), "[0,1,2]");
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_single_id() {
+        assert_eq!(build_milestone_ids_json("3").unwrap(), "[3]");
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_whitespace_trimmed_and_order_preserved() {
+        // Order matters: the contract funds milestones in the order given.
+        assert_eq!(build_milestone_ids_json(" 2 ,\t0, 1\n").unwrap(), "[2,0,1]");
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_max_u32() {
+        let max = u32::MAX.to_string();
+        assert_eq!(build_milestone_ids_json(&max).unwrap(), format!("[{max}]"));
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_empty_rejected() {
+        let err = build_milestone_ids_json("").unwrap_err();
+        assert!(err.contains("no milestone IDs") && err.contains("0,1,2"), "got: {err}");
+        assert!(build_milestone_ids_json("   ").is_err());
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_empty_fields_rejected() {
+        for (csv, idx) in [("0,1,", 2), (",0,1", 0), ("0,,1", 1), ("0, ,1", 1)] {
+            let err = build_milestone_ids_json(csv).unwrap_err();
+            assert!(
+                err.contains(&format!("empty milestone ID at index {idx}")),
+                "{csv:?} -> {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_malformed_rejected() {
+        for bad in ["-1", "abc", "1.5", "0;1", "4294967296", "0 1", "0,--source,x"] {
+            assert!(
+                build_milestone_ids_json(bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_milestone_ids_json_duplicate_rejected() {
+        let err = build_milestone_ids_json("0,1,0").unwrap_err();
+        assert!(err.contains("duplicate milestone ID 0 at index 2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_build_batch_lock_funds_args_shape() {
+        let id = "a".repeat(64);
+        let args = build_batch_lock_funds_args(id.clone(), "0,1,2").unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--agreement-id".to_string(),
+                id,
+                "--milestone-ids".to_string(),
+                "[0,1,2]".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_batch_lock_funds_args_propagates_parse_error() {
+        assert!(build_batch_lock_funds_args("a".repeat(64), "0,x").is_err());
+    }
+
+    #[test]
+    fn test_batch_lock_funds_parses_from_argv() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: Commands,
+        }
+
+        let id = "b".repeat(64);
+        let cli = TestCli::try_parse_from([
+            "trellis",
+            "batch-lock-funds",
+            "--agreement-id",
+            &id,
+            "--milestone-ids",
+            "0,1,2",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::BatchLockFunds {
+                agreement_id,
+                milestone_ids,
+                yes,
+            } => {
+                assert_eq!(agreement_id, id);
+                assert_eq!(milestone_ids, "0,1,2");
+                assert!(yes);
+            }
+            other => panic!("parsed into the wrong command: {other:?}"),
+        }
+
+        // --milestone-ids is required.
+        assert!(
+            TestCli::try_parse_from(["trellis", "batch-lock-funds", "--agreement-id", &id])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_single_lock_funds_still_parses() {
+        // Adjacent regression guard: adding batch-lock-funds must not shadow
+        // or rename the existing single-milestone lock-funds command.
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: Commands,
+        }
+
+        let id = "c".repeat(64);
+        let cli = TestCli::try_parse_from([
+            "trellis",
+            "lock-funds",
+            "--agreement-id",
+            &id,
+            "--milestone-id",
+            "0",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::LockFunds { milestone_id: 0, yes: false, .. }
+        ));
+    }
+
     // --- validate_address: CLI argument injection prevention (#239) ---
 
     fn valid_g_addr() -> String {
@@ -1930,6 +2285,112 @@ mod tests {
         assert!(validate_address("payer", &format!("G{}=", "A".repeat(54))).is_err());
     }
 
+    // --- extend-ttl command (#494) ---
+
+    #[derive(clap::Parser)]
+    struct ExtendTtlCli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[test]
+    fn extend_ttl_parses_from_argv() {
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        let caller = valid_g_addr();
+        let cli = ExtendTtlCli::try_parse_from([
+            "trellis",
+            "extend-ttl",
+            "--agreement-id",
+            &id,
+            "--caller",
+            &caller,
+            "-y",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ExtendTtl {
+                agreement_id,
+                caller: c,
+                yes,
+            } => {
+                assert_eq!(agreement_id, id);
+                assert_eq!(c, caller);
+                assert!(yes);
+            }
+            other => panic!("parsed into the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extend_ttl_requires_caller() {
+        // The entrypoint takes `caller: Address`; omitting it would only fail
+        // later inside the stellar CLI with a less helpful message.
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        assert!(ExtendTtlCli::try_parse_from(["trellis", "extend-ttl", "--agreement-id", &id]).is_err());
+    }
+
+    #[test]
+    fn extend_ttl_args_shape() {
+        let id = "a".repeat(64);
+        let caller = valid_g_addr();
+        assert_eq!(
+            build_extend_ttl_args(id.clone(), caller.clone()),
+            vec![
+                "--agreement-id".to_string(),
+                id,
+                "--caller".to_string(),
+                caller,
+            ]
+        );
+    }
+
+    #[test]
+    fn extend_ttl_caller_rejects_injection() {
+        // `caller` is forwarded verbatim to `stellar contract invoke`, so it
+        // must go through the same strkey check as every other address flag.
+        assert!(validate_address("caller", "GAAAA --source attacker").is_err());
+        assert!(validate_address("caller", &format!("S{}", "A".repeat(55))).is_err());
+    }
+
+    #[test]
+    fn extend_ttl_unconfirmed_fails_closed_under_quiet() {
+        // A keeper running non-interactively without --yes must abort rather
+        // than hang on a prompt or silently submit.
+        let quiet = OutputOpts {
+            format: OutputFormat::Json,
+            quiet: true,
+            dry_run: false,
+        };
+        assert!(confirm_action("extend ttl", false, &quiet).is_err());
+        assert!(confirm_action("extend ttl", true, &quiet).is_ok());
+    }
+
+    #[test]
+    fn existing_cancel_milestone_still_parses() {
+        // Adjacent regression guard: the new subcommand must not disturb the
+        // neighbouring mutating command it was inserted after.
+        use clap::Parser;
+
+        let id = "c".repeat(64);
+        let cli = ExtendTtlCli::try_parse_from([
+            "trellis",
+            "cancel-milestone",
+            "--agreement-id",
+            &id,
+            "--milestone-id",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::CancelMilestone { milestone_id: 1, .. }
+        ));
+    }
+
     // --- validate_agreement_id ---
 
     #[test]
@@ -1994,6 +2455,68 @@ mod tests {
         // Replace one char with null byte representation
         id = id.replacen('a', "\0", 1);
         assert!(validate_agreement_id(&id).is_err());
+    }
+
+    // --- total-amount command (#492) ---
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[test]
+    fn total_amount_parses_from_argv() {
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        let cli =
+            TestCli::try_parse_from(["trellis", "total-amount", "--agreement-id", &id]).unwrap();
+        match cli.command {
+            Commands::TotalAmount { agreement_id } => assert_eq!(agreement_id, id),
+            other => panic!("parsed into the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn total_amount_requires_agreement_id() {
+        use clap::Parser;
+
+        assert!(TestCli::try_parse_from(["trellis", "total-amount"]).is_err());
+    }
+
+    #[test]
+    fn total_amount_takes_no_confirmation_flag() {
+        // Read-only views must not grow a --yes flag: it would imply a
+        // state change that never happens.
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        assert!(
+            TestCli::try_parse_from(["trellis", "total-amount", "--agreement-id", &id, "--yes"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn status_still_parses_alongside_total_amount() {
+        // Adjacent regression guard: the new command must not disturb the
+        // existing `status` view it is modelled on.
+        use clap::Parser;
+
+        let id = "b".repeat(64);
+        let cli = TestCli::try_parse_from(["trellis", "status", "--agreement-id", &id]).unwrap();
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    #[test]
+    fn json_envelope_total_amount_result_is_quoted_i128() {
+        // The stellar CLI prints an i128 return value as a JSON string so it
+        // never loses precision; the envelope must carry it through verbatim.
+        let big = i128::MAX.to_string();
+        let env = json_envelope(&ok_output(&format!("\"{big}\"")));
+        assert_eq!(env["status"], "success");
+        assert_eq!(env["result"], big);
     }
 
     // --- validate_proof_uri ---
