@@ -3,8 +3,8 @@ use soroban_sdk::contracterror;
 /// Canonical error type for the Trellis Protocol contract.
 ///
 /// `#[contracterror]` serialises each variant's `u32` discriminant into the
-/// XDR `ScError` envelope returned to the invoker, making error codes part of
-/// the public on-chain ABI.
+/// XDR `ScError` envelope returned to the invoker, making error codes part of the
+/// public on-chain ABI.
 ///
 /// # Stability rule
 /// Discriminant values are **permanent** from the first mainnet deployment
@@ -15,11 +15,27 @@ use soroban_sdk::contracterror;
 /// was renumbered from `7` to `6` to close the gap. `NoFundsToRefund` (then
 /// discriminant `6`) was itself later removed for the same reason: no
 /// codepath ever returned it. Discriminant `6` is left vacant rather than
-/// reused, per the append-only rule above. SDK consumers pinned to the old
+/// reused, per the append-only rule above. SDT consumers pinned to the old
 /// numbering must regenerate their bindings.
+///
+/// # Exhaustiveness
+/// `#[non_exhaustive]` is what makes the append-only rule above enforceable by
+/// the compiler rather than by convention. Without it, any downstream `match`
+/// over `TrellisError` that enumerates the current variants is accepted today
+/// and becomes a hard compile error the next time a variant is appended —
+/// turning a documented stability guarantee into a breaking change for
+/// consumers. With it, downstream matches are required to carry a wildcard arm
+/// from the start, so appending a variant stays non-breaking.
+///
+/// This is the same treatment [`crate::types::EscrowStatus`] already has, and
+/// for the same reason: both are append-only enums in the public ABI. No `match`
+/// inside this crate is exhaustive over `TrellisError` (every site either
+/// constructs an error or compares against one), so the attribute costs
+/// nothing here.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum TrellisError {
     /// The contract or agreement has already been initialised.
     /// Prevents duplicate `create_agreement` calls for the same ID.
@@ -66,13 +82,76 @@ pub enum TrellisError {
     /// represents an active, functional token contract.
     InvalidToken = 10,
 
-    /// `init` was called with more than `MAX_MILESTONES` milestones.
-    /// An oversized milestone list would make every later read, write and
-    /// status transition cost unbounded gas, so it is rejected up front.
-    MilestoneCountExceeded = 11,
+    /// `init` was called with a milestone whose `status` is not
+    /// [`EscrowStatus::Pending`].
+    ///
+    /// Every agreement sharing a token draws from one pooled contract
+    /// balance, so a milestone created in a pre-advanced state is a claim on
+    /// funds that were never escrowed for it. A `WorkSubmitted` milestone
+    /// could go straight to `approve_and_release` and a `Disputed` one to
+    /// `resolve_dispute`, either of which transfers tokens out of the pool
+    /// to the payee or back to the payer without anything having been
+    /// locked. `Pending` is the only valid initial state: it is the sole
+    /// entry point of the state machine, and every later transition is
+    /// reached by funding the milestone first.
+    ///
+    /// Appended as discriminant `11` per the stability rule above; it is a
+    /// distinct economic condition from [`TrellisError::InvalidMilestone`]
+    /// (which covers amounts and indices) and deserves its own code so an
+    /// integrator can tell "you sent a bad amount" from "you tried to
+    /// pre-advance a milestone".
+    InvalidInitialMilestoneStatus = 11,
 
-    /// `init` was called with `payer == payee`. A single address cannot both
-    /// fund the escrow and be paid out of it, which would let one party
-    /// unilaterally release its own funds.
-    PayerEqualsPayee = 12,
+    /// The payer/payee split supplied to `resolve_dispute` does not sum
+    /// to the milestone's locked amount. A split resolution must account
+    /// for every unit of escrowed funds exactly once; any other total either
+    /// leaves funds stranded in the contract or attempts to pay out more
+    /// than was locked.
+    InvalidSplitAmounts = 12,
+
+    /// `init` was called with more milestones than the contract's
+    /// `MAX_MILESTONES` cap (50). Beyond that cap the per-agreement storage
+    /// and gas costs grow without bound, so oversized agreements are rejected
+    /// up front.
+    ///
+    /// Appended as discriminant `13` per the stability rule above (`11` and
+    /// `12` are already assigned).
+    MilestoneCountExceeded = 13,
+
+    /// `init` was called with `payer == payee`, which would collapse both
+    /// sides of the escrow into a single address — there would be no real
+    /// counterparty to release or dispute funds.
+    PayerEqualsPayee = 14,
+
+    /// `set_milestone_deadline` was called with a deadline that is not
+    /// strictly in the future (`deadline <= env.ledger().timestamp()`).
+    /// Such a deadline would make the milestone immediately expirable.
+    DeadlineInPast = 15,
+
+    /// `expire_milestone` was called on a milestone that has no deadline, or
+    /// whose deadline has not yet passed.
+    DeadlineNotReached = 16,
+
+    /// `submit_work` was called with a `proof_uri` longer than
+    /// [`crate::MAX_PROOF_URI_LEN`].
+    ///
+    /// The URI is stored verbatim and kept for the agreement's lifetime, so an
+    /// unbounded length would be a permanent storage/rent cost imposed on the
+    /// payer by the payee. Rejecting it up front keeps an agreement's storage
+    /// footprint bounded by something the contract controls.
+    ///
+    /// Appended as discriminant `17` per the stability rule above (`16` is the
+    /// highest already assigned).
+    ProofUriTooLong = 17,
+
+    /// `release_partial` was called with an `amount` that is zero, negative,
+    /// or larger than what is still escrowed for the milestone.
+    ///
+    /// Partially-released funds are final, so an over-release would attempt to
+    /// pay out more than the milestone ever locked and either trap inside the
+    /// token contract or drain funds belonging to other milestones sharing the
+    /// same pooled balance.
+    ///
+    /// Appended as discriminant `18` per the stability rule above.
+    InvalidReleaseAmount = 18,
 }

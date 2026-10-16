@@ -113,6 +113,7 @@
 **Trustless, milestone-based escrow for freelance and remote work — built on Stellar's Soroban smart contract platform.**
 
 [![Contract CI](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/contract-ci.yml/badge.svg)](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/contract-ci.yml)
+[![Testnet E2E](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/e2e-testnet.yml/badge.svg)](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/e2e-testnet.yml)
 [![Frontend CI](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/frontend-ci.yml/badge.svg)](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/frontend-ci.yml)
 [![npm audit](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/npm-audit.yml/badge.svg)](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/npm-audit.yml)
 [![CodeQL](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/Trellis-Ecosystem/trellis/actions/workflows/codeql-analysis.yml)
@@ -179,11 +180,11 @@ A live test agreement exists on-chain and is queryable right now:
 trellis status --agreement-id 0101010101010101010101010101010101010101010101010101010101010101
 ```
 
-| Attribute | Value |
-|---|---|
-| **Contract ID** | `CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q` |
-| **Network** | Stellar Testnet |
-| **Explorer** | [View on Stellar Lab](https://lab.stellar.org/r/testnet/contract/CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q) |
+| Attribute       | Value                                                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| **Contract ID** | `CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q`                                                                 |
+| **Network**     | Stellar Testnet                                                                                                            |
+| **Explorer**    | [View on Stellar Lab](https://lab.stellar.org/r/testnet/contract/CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q) |
 
 > Full deployment details, every verified command, and step-by-step deployment instructions are in [DEPLOYMENT.md](./DEPLOYMENT.md).
 
@@ -352,10 +353,10 @@ Trellis models a freelance engagement as an **agreement** made up of one or more
 
 ### The Roles
 
-| Role | Responsibility |
-|---|---|
-| **Payer** 🧑‍💼 | Funds milestones and approves completed work |
-| **Payee** 👨‍💻 | Submits proof of completed work and receives payment on approval |
+| Role                    | Responsibility                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| **Payer** 🧑‍💼            | Funds milestones and approves completed work                                   |
+| **Payee** 👨‍💻            | Submits proof of completed work and receives payment on approval               |
 | **Dispute Resolver** ⚖️ | A neutral third party who can rule on disputes, releasing funds to either side |
 
 ### The Guarantees
@@ -477,28 +478,69 @@ Trellis is a monorepo with three layers:
 | `init` | Payer | Creates a new agreement with one or more milestones (each `amount` must be strictly positive) |
 | `lock_funds` | Payer | Deposits funds for a milestone into the contract |
 | `submit_work` | Payee | Submits proof of completed work for a funded milestone |
-| `approve_and_release` | Payer | Approves submitted work, releases funds to payee |
+| `approve_and_release` | Payer | Approves submitted work, releases the remaining escrowed funds to payee |
+| `release_partial` | Payer | Releases part of a `Funded`/`WorkSubmitted` milestone's escrowed funds as a progress payment; the milestone completes once fully released |
 | `raise_dispute` | Payer or Payee | Flags a milestone for resolver review |
 | `resolve_dispute` | Dispute Resolver | Rules on a dispute — refunds payer or pays payee |
-| `cancel_unfunded_milestone` | Payer | Cancels a milestone that was never funded |
+| `rotate_resolver` | Payer and Payee | Replaces the dispute resolver when the incumbent is lost, compromised or unresponsive; the outgoing resolver does not have to sign |
+| `cancel_unfunded_milestone` | Payer | Cancels a milestone that was never funded — status becomes `Cancelled`, never `Refunded` (reserved for dispute refunds) |
 | `get_agreement` | Anyone | Returns the full current state of an agreement (read-only) |
 | `get_total_amount` | Anyone | Returns the agreement's total value — sum of all milestone amounts (read-only) |
+| `batch_lock_funds` | Payer | Funds multiple milestones atomically in one transaction |
+| `get_milestone` | Anyone | Returns a single milestone's state, or none if the agreement or milestone does not exist (read-only) |
 | `extend_agreement_ttl` | Anyone | Renews an agreement's ledger TTL to avoid archival |
+| `set_milestone_deadline` | Payer | Sets an optional deadline (ledger timestamp) on a still-`Pending` milestone |
+| `get_milestone_deadline` | Anyone | Returns a milestone's deadline, if one is set (read-only) |
+| `expire_milestone` | Anyone | After the deadline, closes a stalled `Pending` or `Funded` milestone as `Refunded`, returning any locked funds to the payer |
+
+<details>
+<summary>🧬 <strong>Native ScVal Encoding</strong></summary>
+<br />
+The CLI builds Soroban <code>ScVal</code> arguments natively in Rust instead of relying on the <code>stellar</code> CLI's JSON-to-XDR conversion. Scalar arguments (addresses, <code>i128</code> amounts, symbols) are encoded by the scalar encoder, and the milestone vector passed to <code>init</code> is encoded by a dedicated builder that mirrors the contract's exact <code>#[contracttype]</code> layout: each <code>Milestone</code> is a struct-of-fields map, <code>amount</code> is an <code>ScVal::I128</code>, and <code>status</code> is encoded as the <code>EscrowStatus::Pending</code> enum tag. The resulting <code>Vec&lt;Milestone&gt;</code> <code>ScVal</code> is cross-checked against what the <code>stellar</code> CLI produces for the same input.
+</details>
 
 <details>
 <summary>📦 <strong>Storage Lifetime</strong></summary>
 <br />
-Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent.
+Soroban archives persistent ledger entries once their TTL expires, so an agreement that is never touched would eventually be lost. Every state-mutating entrypoint renews the agreement's TTL to ~30 days automatically, and the view functions (<code>get_agreement</code>, <code>get_milestone</code>, <code>get_total_amount</code>) renew it as well whenever a read finds the remaining TTL below the threshold — so a read is not strictly side-effect free, and the caller pays for the extension. Reading keeps a watched agreement alive between transitions rather than leaving it to expire. Agreements that stay idle longer than that — a long delivery window, a stalled dispute — need <code>extend_agreement_ttl</code> called before the TTL runs out; any address may call it, and the caller pays the rent.
+</details>
+
+<details>
+<summary>⏱️ <strong>Milestone Deadlines</strong></summary>
+<br />
+A milestone can carry an optional deadline so an unresponsive counterparty cannot stall it forever. The payer sets it with <code>set_milestone_deadline</code> while the milestone is still <code>Pending</code>, so the payee sees it before any funds are locked or work starts. It is a ledger timestamp (Unix seconds) and must be in the future. Once <code>env.ledger().timestamp()</code> is past the deadline, anyone (payer, payee or a keeper) may call <code>expire_milestone</code>:
+
+<ul>
+<li><code>Pending</code> (never funded) → <code>Refunded</code>; no tokens move.</li>
+<li><code>Funded</code> (payee never submitted work) → <code>Refunded</code>; the locked amount returns to the payer.</li>
+<li><code>WorkSubmitted</code> and <code>Disputed</code> are <em>never</em> expired: once the payee has delivered, a silent payer must not win by default, and a timeout must not cut arbitration short. Use <code>raise_dispute</code> / <code>resolve_dispute</code> instead.</li>
+</ul>
+
+Tradeoffs: timestamps are used instead of ledger sequences because deadlines are agreed in wall-clock terms and ledger close times vary; validators bound timestamp drift, so this is precise to within seconds, not to the ledger. Expiry is an explicit call rather than automatic, because Soroban has no scheduler. Deadlines live in a separate storage entry (not a <code>Milestone</code> field), so the <code>init</code> argument layout and every existing caller are unchanged. That entry has its TTL renewed alongside the agreement's.
+</details>
+
+<details>
+<summary>🔁 <strong>Rotating the Dispute Resolver</strong></summary>
+<br />
+The dispute resolver is chosen at <code>init</code> and is otherwise fixed for the agreement's lifetime. Because <code>resolve_dispute</code> and <code>resolve_dispute_split</code> are gated solely by that address, a resolver whose key is lost or compromised — or which simply stops answering — would leave every <code>Disputed</code> milestone permanently unsettleable. <code>rotate_resolver</code> closes that single point of failure:
+
+<pre><code>rotate_resolver &#40;agreement_id, new_resolver&#41;</code></pre>
+
+Both the payer and the payee must sign. That is what stops the rotation becoming an attack in its own right: with a single-party gate, either side could install a resolver it controls and then have that resolver rule on the resulting dispute. The <em>outgoing</em> resolver is deliberately not asked to sign — the situations this entrypoint exists for are exactly those where its signature is unavailable or worthless. The incoming resolver does not sign either; it gains the authority to settle disputes the moment the rotation lands.
+
+Rotation only changes <code>dispute_resolver</code>. Milestone statuses, escrowed balances, <code>total_amount</code>, release ledgers and deadlines are untouched and no tokens move, so it is safe at any point in the agreement's life — <strong>including while a milestone is actively <code>Disputed</code></strong>. That is the rescue path: rotation hands the ruling over, it does not substitute for one, so the dispute stays open and the replacement settles it. Milestones already ruled on are final and are never re-opened.
+
+The new resolver must not be the payer or the payee — the same neutrality invariant <code>init</code> enforces, re-checked on every rotation. Each rotation emits a <code>resolver_rotated</code> event carrying both the old and the new address, so the full resolver history of an agreement is reconstructible from the event log even though <code>get_agreement</code> only ever exposes the incumbent.
 </details>
 
 ### Tech Stack
 
 <div align="center">
 
-| Category | Technologies |
-|---|---|
+| Category           | Technologies                                                                                                         |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
 | **Smart Contract** | [Soroban](https://developers.stellar.org/docs/build/smart-contracts) · soroban-sdk 22.x · Rust (`#![no_std]` → WASM) |
-| **CLI** | clap 4 · clap_complete · reqwest · serde + serde_json · dotenvy |
+| **CLI** | clap 4 · clap_complete · serde + serde_json · dotenvy |
 | **Frontend** | React 19 · Vite · TypeScript · Tailwind CSS · React Router |
 | **Stellar SDK** | @stellar/stellar-sdk · @stellar/freighter-api · Soroban RPC |
 
@@ -524,7 +566,7 @@ npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, and full agreement management UI.
+Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, live contract activity stats (agreements created / milestones locked, within the RPC event retention window), and full agreement management UI.
 
 ### 📡 Run the event indexer (optional)
 
@@ -551,7 +593,7 @@ cd contracts/trellis_core
 cargo test
 ```
 
-All 9 integration tests run in the Soroban sandbox — happy path, double-init protection, dispute resolution, milestone cancellation (including the state-transition guard on already-funded milestones), positive-amount validation on `init`, the pre-computed `total_amount`, and the `get_agreement` view function.
+The suite has 89 tests, all run in the Soroban sandbox: 63 example-based tests in `test.rs` (happy path, double-init protection, dispute resolution, resolver rotation, milestone cancellation, role checks, batch operations, TTL extension, and the `get_agreement` view function), 14 property-based `proptest` tests in `test_properties.rs` (balance conservation, invalid amounts, milestone isolation), 9 panic-boundary tests in `test_panic_boundaries.rs`, and 3 storage-layout tests in `test_storage.rs`.
 
 ### 📦 Build everything at once
 
@@ -630,11 +672,16 @@ trellis init \
 # Check status
 trellis status --agreement-id <hex-id>
 
+# Check a single milestone's status
+trellis milestone-status --agreement-id <hex-id> --milestone-id 0
+
 # Fund the first milestone
 trellis lock-funds --agreement-id <hex-id> --milestone-id 0
 ```
 
-All **8 CLI commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, and `status`. See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
+All **9 escrow commands** are implemented — `init`, `lock-funds`, `submit-work`, `approve-release`, `raise-dispute`, `resolve-dispute`, `cancel-milestone`, `status`, and `milestone-status`. The CLI also provides two utility commands: `completion` (see [Shell Completions](#shell-completions)) and `keys` (manage secret keys in the OS keychain). See [DEPLOYMENT.md](./DEPLOYMENT.md) for the full command reference.
+
+`trellis health` checks the configured RPC endpoint natively (`getHealth` + `getLatestLedger` over HTTP). It needs only an RPC URL, with no `stellar` binary, contract ID or source key, and it supports `--json` / `--human-readable` / `--quiet` / `--dry-run`.
 
 #### Global Output Flags
 
@@ -654,7 +701,46 @@ trellis status --agreement-id <hex-id> --quiet
 trellis status --agreement-id <hex-id> --human-readable   # or -H
 ```
 
+Read-only queries (`status`, `milestone-status`) decode the raw XDR `ScVal`
+returned by `simulateTransaction` natively in the CLI — no `stellar` binary is
+required for these commands. The decoded result is rendered through the same
+`render_json`/`render_human` paths as every other command, so `--json`,
+`--human-readable`, and `--quiet` all behave identically whether or not the
+Stellar CLI is installed.
+
+Native transaction simulation is implemented in
+`cli/trellis_cli/src/rpc.rs` (`RpcClient::simulate_transaction`) against the
+Soroban JSON-RPC `simulateTransaction` method. For a base64
+`TransactionEnvelope` XDR it returns a typed result containing the recommended
+minimum resource fee (`minResourceFee`), the resource fee and instruction /
+I/O-byte budgets embedded in the `transactionData`, and the fully parsed
+ledger footprint (its read-only and read-write `LedgerKey`s). For a read-only
+invocation the returned `results[0].xdr` `ScVal` is decoded directly, so a
+query value can be fetched without any signing key. A reverted host function
+call is surfaced as a typed contract error, kept distinct from network-level
+and JSON-RPC-level failures so callers can tell "the contract said no" apart
+from "the network was unreachable".
+
+`--dry-run` prints the `stellar contract invoke` command that would be executed
+without actually running it or submitting anything on-chain. Because it never
+spawns the `stellar` binary, it works on machines where the Stellar CLI is not
+installed — useful for previewing command construction in CI or on a fresh
+checkout.
+
+Milestone arguments passed to `init` (e.g. `--milestones "1000,2000"`) are
+encoded to Soroban `ScVal` natively by the CLI, matching the contract's
+`Vec<Milestone>` layout — no `stellar` CLI conversion step is involved.
+
 `--json` takes priority over `--human-readable` when both are passed.
+
+#### Network Passphrase Verification
+
+Before any command runs, the CLI calls the configured RPC endpoint's `getNetwork`
+method and compares the returned `passphrase` against `--network-passphrase`
+(or `STELLAR_NETWORK_PASSPHRASE`). If they differ, the command fails early with
+an error naming both values, so a mismatched `--rpc-url` (e.g. mainnet RPC with a
+testnet passphrase) is caught immediately instead of surfacing as a confusing
+downstream failure. This check is skipped under `--dry-run`.
 
 #### Shell Completions
 
@@ -677,26 +763,28 @@ Supported shells: `bash`, `zsh`, `fish`, `elvish`, `powershell`.
 
 ### ✅ Complete
 
-- Core Soroban escrow contract — all 10 entrypoints implemented and tested
+- Core Soroban escrow contract - all 13 entrypoints implemented and tested
 - Full state machine — happy path, dispute resolution, and cancellation paths
-- Integration test suite — 41/41 passing in the Soroban sandbox
+- Contract test suite - 89 tests in the Soroban sandbox
 - Full CLI — all 8 commands wired end-to-end with JSON, dry-run, and human-readable output modes
+- Native ScVal encoding — scalar arguments and the `Vec<Milestone>` argument to `init` are built directly in Rust
 - Deployed live on Stellar testnet — `init` and `status` verified against the live contract
 - Frontend dashboard — 5 pages, 28 components, 12 custom hooks, animated particle network background
 - Wallet connect — Freighter wallet integration with connection states
-- Event feed — real-time on-chain event history per agreement
+- Event feed — real-time on-chain event history per agreement (limited to the last ~100k ledgers, ~6 days, that RPC providers retain; full history awaits an event-indexing service, #496)
 - Shell completions — bash, zsh, fish, elvish, powershell
+- Native strkey codec — `G...`/`S...`/`C...` Stellar address encode/decode with CRC16 checksum validation (`cli/trellis_cli/src/strkey.rs`)
 
 ### 🚧 Open for Contribution
 
-| Area | Description | Difficulty |
-|---|---|---|
-| Frontend — Agreement Status page | Polish and edge cases for live agreement state display | Intermediate |
-| Frontend — Create Agreement form | Validation UX, milestone builder refinements | Intermediate |
-| Frontend — Milestone actions | lock, submit, approve, dispute button workflows | Intermediate |
-| Frontend — Event feed enhancements | Real-time updates, filtering, pagination | Intermediate |
-| Native RPC client | Replace stellar CLI shell-out with native Rust HTTP client | Advanced |
-| Documentation | CONTRIBUTING.md and contributor onboarding guide | Beginner |
+| Area                               | Description                                                | Difficulty   |
+| ---------------------------------- | ---------------------------------------------------------- | ------------ |
+| Frontend — Agreement Status page   | Polish and edge cases for live agreement state display     | Intermediate |
+| Frontend — Create Agreement form   | Validation UX, milestone builder refinements               | Intermediate |
+| Frontend — Milestone actions       | lock, submit, approve, dispute button workflows            | Intermediate |
+| Frontend — Event feed enhancements | Real-time updates, filtering, pagination                   | Intermediate |
+| Native RPC client                  | Replace stellar CLI shell-out with native Rust HTTP client | Advanced     |
+| Documentation                      | CONTRIBUTING.md and contributor onboarding guide           | Beginner     |
 
 See [Issues](../../issues) for the full task list — each issue has exact requirements, acceptance criteria, a suggested branch name, and a timeframe.
 

@@ -3,6 +3,7 @@ import { xdr } from '@stellar/stellar-sdk'
 import { CONTRACT_ID, RPC_URL, getIndexerUrl } from '../lib/config'
 import { hexToBytes } from '../lib/format'
 import { fetchIndexedEvents, openIndexerStream } from '../lib/indexer'
+import { getRecentStartLedger, isRetentionWindowError, RETENTION_WINDOW_MESSAGE } from '../lib/eventWindow'
 import type { RawEventResponse } from '../lib/soroban'
 import { isValidEventResponse } from '../lib/soroban'
 
@@ -95,12 +96,14 @@ export function useAgreementEvents(agreementId: string | null) {
         const idScVal = xdr.ScVal.scvBytes(idBytes)
         const idTopic = idScVal.toXDR('base64')
 
+        const startLedger = await getRecentStartLedger(mergedSignal)
+
         const body = {
           jsonrpc: '2.0',
           id: 1,
           method: 'getEvents',
           params: {
-            startLedger: 1,
+            startLedger,
             filters: [
               {
                 type: 'contract',
@@ -154,7 +157,8 @@ export function useAgreementEvents(agreementId: string | null) {
         console.error('[useAgreementEvents] Failed to fetch:', err)
 
         if (!unmountedRef.current) {
-          setError(err instanceof Error ? err.message : 'Failed to fetch events')
+          const message = err instanceof Error ? err.message : 'Failed to fetch events'
+          setError(isRetentionWindowError(message) ? RETENTION_WINDOW_MESSAGE : message)
           setIsLoading(false)
         }
 
