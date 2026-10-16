@@ -323,7 +323,42 @@ After a successful reset the script updates, in place:
 - **`frontend/.env.example`** — `VITE_CONTRACT_ID` is updated so new
   checkouts default to the live contract.
 
-Nothing is written if any earlier step (build, deploy, `trellis init`) fails.
+Nothing is written if any earlier step (build, deploy, `trellis init`, or the
+verification below) fails.
+
+### Verifying a reset
+
+A reset is only done once the new agreement can actually move funds — an
+agreement can be created successfully with a token address that no
+`lock_funds` call can ever transfer from. `scripts/reset-testnet.sh` checks
+this itself before updating any files, and exits non-zero if any check fails:
+
+1. **Token is a token contract.** The test agreement uses the native XLM
+   Stellar Asset Contract (`stellar contract id asset --asset native`), which
+   must resolve to a `C…` contract ID. A `G…` account/issuer address is not a
+   token and will make every `lock_funds` fail.
+2. **Agreement reads back.** `trellis status` returns the new agreement and
+   it references the expected payer, payee, resolver and token.
+3. **Funds actually move.** `trellis lock-funds` funds milestone 0 as
+   `trellis-payer`, `trellis milestone-status` reports `Funded`, and the
+   token's `balance` for the new contract equals the milestone amount.
+
+As a result the test agreement in
+[Verified Test Agreement](#verified-test-agreement) is left with milestone 0
+`Funded`, ready for `submit-work` / `approve-release` testing.
+
+If you reset manually (steps 1–3 above) instead, run the same checks by hand:
+
+```bash
+TOKEN_ID=$(stellar contract id asset --asset native --network testnet)
+# ... trellis init --token "$TOKEN_ID" ... (see CLI Usage)
+
+trellis status --agreement-id <new-id>
+TRELLIS_SOURCE_KEY=<payer identity> trellis lock-funds --agreement-id <new-id> --milestone-id 0
+trellis milestone-status --agreement-id <new-id> --milestone-id 0   # expect Funded
+stellar contract invoke --id "$TOKEN_ID" --network testnet --source <any identity> \
+  -- balance --id <new contract id>                                 # expect the milestone amount
+```
 Review and commit the changes with `git diff DEPLOYMENT.md
 frontend/.env.example` (`frontend/.env` is git-ignored).
 

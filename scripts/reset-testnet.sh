@@ -3,6 +3,12 @@
 # agreement. Use this after a testnet reset invalidates the contract ID or
 # agreement ID referenced in DEPLOYMENT.md.
 #
+# Before touching any files it verifies its own output end-to-end: the new
+# agreement is queried back from the chain, and milestone 0 is funded with a
+# real lock_funds token transfer from the payer, so a reset that produced an
+# unusable agreement (e.g. a non-token `--token` address) fails loudly here
+# instead of surfacing later.
+#
 # On success it writes the new values back into DEPLOYMENT.md (the
 # `reset-testnet:begin/end` marker blocks), frontend/.env and
 # frontend/.env.example, so no manual copy-paste is needed. Nothing is
@@ -71,6 +77,15 @@ set_env_var() {
   rm -f "$tmp"
 }
 
+# fail MESSAGE [DETAIL] — print a verification failure and exit non-zero.
+fail() {
+  echo "error: $1" >&2
+  if [[ -n "${2:-}" ]]; then
+    echo "$2" >&2
+  fi
+  exit 1
+}
+
 # Check the doc markers up front so a broken DEPLOYMENT.md fails fast, before
 # spending several minutes building and deploying.
 for block in "${DOC_BLOCKS[@]}"; do
@@ -131,11 +146,19 @@ done
 PAYER=$(stellar keys address trellis-payer)
 PAYEE=$(stellar keys address trellis-payee)
 RESOLVER=$(stellar keys address trellis-resolver)
-USDC_ISSUER="GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
-# `init` needs the USDC Stellar Asset Contract (C...) address, not the
-# issuer account (G...) — derive it from the asset.
-USDC_SAC=$(stellar contract id asset --network testnet --asset "USDC:$USDC_ISSUER")
 AGREEMENT_ID=$(printf '01%.0s' {1..64} | head -c 64)
+MILESTONE_AMOUNT=1000
+
+# The agreement's token must be a token *contract* (C…), not an account or
+# asset-issuer address (G…) — otherwise init succeeds but every lock_funds
+# fails. Use the native XLM Stellar Asset Contract rather than USDC: Friendbot
+# funds the payer with XLM only, so the lock_funds smoke test below can move
+# real funds with no trustline or faucet setup.
+echo "==> Resolving native XLM token contract (SAC) on testnet"
+TOKEN_ID=$(stellar contract id asset --asset native --network testnet)
+if [[ ! "$TOKEN_ID" =~ ^C[A-Z2-7]{55}$ ]]; then
+  fail "unexpected token contract ID from 'stellar contract id asset': '$TOKEN_ID'"
+fi
 
 export STELLAR_RPC_URL="$RPC_URL"
 export STELLAR_NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE"
@@ -147,9 +170,43 @@ echo "==> Creating fresh test agreement"
   --agreement-id "$AGREEMENT_ID" \
   --payer "$PAYER" \
   --payee "$PAYEE" \
-  --token "$USDC_SAC" \
+  --token "$TOKEN_ID" \
   --resolver "$RESOLVER" \
-  --milestones "1000"
+  --milestones "$MILESTONE_AMOUNT" \
+  --yes
+
+echo "==> Verifying the agreement can be queried back from the chain"
+AGREEMENT_OUT=$("$CLI_BIN" status --agreement-id "$AGREEMENT_ID") ||
+  fail "'trellis status' could not read back agreement $AGREEMENT_ID"
+for expected in "$PAYER" "$PAYEE" "$RESOLVER" "$TOKEN_ID"; do
+  grep -q "$expected" <<<"$AGREEMENT_OUT" ||
+    fail "agreement $AGREEMENT_ID does not reference $expected" "$AGREEMENT_OUT"
+done
+
+echo "==> Smoke test: locking milestone 0 funds as the payer"
+TRELLIS_SOURCE_KEY=trellis-payer "$CLI_BIN" lock-funds \
+  --agreement-id "$AGREEMENT_ID" \
+  --milestone-id 0 \
+  --yes ||
+  fail "lock_funds failed against the freshly created agreement"
+
+MILESTONE_OUT=$("$CLI_BIN" milestone-status --agreement-id "$AGREEMENT_ID" --milestone-id 0) ||
+  fail "'trellis milestone-status' could not read back milestone 0"
+grep -qw "Funded" <<<"$MILESTONE_OUT" ||
+  fail "milestone 0 is not Funded after lock_funds" "$MILESTONE_OUT"
+
+# The status flip alone doesn't prove tokens moved; check the escrow balance.
+# The contract was deployed fresh above, so it must hold exactly one
+# milestone's worth.
+ESCROW_BALANCE=$(stellar contract invoke \
+  --id "$TOKEN_ID" \
+  --source "$DEPLOYER_KEY" \
+  --network testnet \
+  -- balance --id "$CONTRACT_ID" | tr -d '"[:space:]')
+if [[ "$ESCROW_BALANCE" != "$MILESTONE_AMOUNT" ]]; then
+  fail "escrow contract holds '$ESCROW_BALANCE' stroops after lock_funds, expected $MILESTONE_AMOUNT"
+fi
+echo "    agreement readable, milestone 0 Funded, escrow balance $ESCROW_BALANCE stroops"
 
 if [[ -n "$DEPLOY_TX" ]]; then
   DEPLOY_TX_LINK="https://stellar.expert/explorer/testnet/tx/$DEPLOY_TX"
@@ -174,7 +231,8 @@ replace_block "$DEPLOYMENT_DOC" test-agreement "| Field | Value |
 | Agreement ID | \`$AGREEMENT_ID\` |
 | Payer | \`$PAYER\` |
 | Payee | \`$PAYEE\` |
-| Milestone 0 | 1000 stroops, status: Pending |"
+| Token | \`$TOKEN_ID\` (native XLM SAC) |
+| Milestone 0 | $MILESTONE_AMOUNT stroops, status: Funded (locked by the reset smoke test) |"
 
 replace_block "$DEPLOYMENT_DOC" verify-agreement "\`\`\`bash
 trellis status --agreement-id $AGREEMENT_ID
@@ -202,6 +260,10 @@ Agreement ID:  $AGREEMENT_ID
 Payer:         $PAYER
 Payee:         $PAYEE
 Resolver:      $RESOLVER
+Token:         $TOKEN_ID (native XLM SAC)
+
+Verified: agreement read back on-chain; milestone 0 funded via lock_funds
+($ESCROW_BALANCE stroops held in escrow).
 
 Verify with:
   TRELLIS_CONTRACT_ID=$CONTRACT_ID $CLI_BIN status --agreement-id $AGREEMENT_ID
