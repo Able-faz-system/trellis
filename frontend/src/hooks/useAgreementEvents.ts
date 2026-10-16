@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { xdr } from '@stellar/stellar-sdk'
-import { CONTRACT_ID, RPC_URL } from '../lib/config'
+import { CONTRACT_ID, RPC_URL, getIndexerUrl } from '../lib/config'
 import { hexToBytes } from '../lib/format'
+import { fetchIndexedEvents, openIndexerStream } from '../lib/indexer'
 import type { RawEventResponse } from '../lib/soroban'
 import { isValidEventResponse } from '../lib/soroban'
 
 export interface AgreementEvent {
+  /** RPC event id — present for events from RPC or the indexer, used to de-duplicate. */
+  id?: string
   type: string
   ledger: number
   txHash: string
@@ -28,7 +31,13 @@ const FETCH_TIMEOUT_MS = 30_000     // Per-request timeout: 30 seconds
 /**
  * Fetch and parse contract events for a specific agreement.
  *
- * Uses a recursive setTimeout chain so the next poll only starts after the
+ * When VITE_INDEXER_URL is set, history and live updates come from the
+ * indexer/relay over a single SSE stream (snapshot, then deltas) — no RPC
+ * polling from the browser, and history survives the RPC node's retention
+ * window. If the relay is unset or unreachable, falls back to the direct RPC
+ * polling below.
+ *
+ * Direct polling uses a recursive setTimeout chain so the next poll only starts after the
  * current fetch completes, preventing concurrent request stacking.  Applies
  * linear backoff (capped at MAX_POLL_INTERVAL_MS) when a fetch fails so a
  * flaky network doesn't hammer the RPC endpoint.
@@ -44,6 +53,9 @@ export function useAgreementEvents(agreementId: string | null) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Signals that the component has unmounted — used to suppress state updates.
   const unmountedRef = useRef(false)
+  // True while events are being delivered by the indexer relay rather than
+  // by direct RPC polling; decides which source `refetch` hits.
+  const relayActiveRef = useRef(false)
 
   const fetchEvents = useCallback(
     async (signal: AbortSignal): Promise<boolean> => {
@@ -118,25 +130,7 @@ export function useAgreementEvents(agreementId: string | null) {
         }
 
         const rawEvents: unknown[] = json.result?.events || []
-
-        const parsed: AgreementEvent[] = rawEvents
-          .filter(isValidEventResponse)
-          .map((e: RawEventResponse) => {
-            const eventType = parseEventType(e)
-            const eventData = parseEventData(e)
-
-            return {
-              type: eventType,
-              ledger: e.ledger || 0,
-              txHash: e.txHash || '',
-              timestamp: e.ledgerClosedAt || new Date().toISOString(),
-              agreementId,
-              ...eventData,
-            }
-          })
-
-        // Sort by ledger descending (newest first)
-        parsed.sort((a, b) => b.ledger - a.ledger)
+        const parsed = toAgreementEvents(rawEvents, agreementId)
 
         if (!unmountedRef.current) {
           setEvents(parsed)
@@ -178,6 +172,7 @@ export function useAgreementEvents(agreementId: string | null) {
     failureCount.current = 0
 
     const controller = new AbortController()
+    let closeStream: (() => void) | null = null
 
     /**
      * Recursive polling: schedule the next poll only after the current fetch
@@ -199,20 +194,65 @@ export function useAgreementEvents(agreementId: string | null) {
       }, delayMs)
     }
 
-    // Fire immediately (0 ms delay), then recurse.
-    schedule(0)
+    const startPolling = () => {
+      relayActiveRef.current = false
+      if (controller.signal.aborted) return
+      // Fire immediately (0 ms delay), then recurse.
+      schedule(0)
+    }
+
+    if (agreementId && getIndexerUrl()) {
+      relayActiveRef.current = true
+      setIsLoading(true)
+      setError(null)
+      closeStream = openIndexerStream(
+        `/stream/events?agreementId=${encodeURIComponent(agreementId)}`,
+        {
+          snapshot: (data) => {
+            if (unmountedRef.current) return
+            setEvents(toAgreementEvents(eventsOf(data), agreementId))
+            setIsLoading(false)
+          },
+          events: (data) => {
+            if (unmountedRef.current) return
+            const fresh = toAgreementEvents(eventsOf(data), agreementId)
+            setEvents((prev) => mergeEvents(prev, fresh))
+          },
+        },
+        startPolling,
+      )
+    } else {
+      startPolling()
+    }
 
     return () => {
       unmountedRef.current = true
       controller.abort()
+      closeStream?.()
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current)
         timerRef.current = null
       }
     }
-  }, [fetchEvents])
+  }, [fetchEvents, agreementId])
 
   const refetch = useCallback(() => {
+    if (relayActiveRef.current && agreementId) {
+      // The relay pushes new events on its own; a manual refetch just reloads
+      // the stored history from the indexer's query API.
+      setError(null)
+      fetchIndexedEvents(agreementId, new AbortController().signal)
+        .then((raw) => {
+          if (!unmountedRef.current) setEvents(toAgreementEvents(raw, agreementId))
+        })
+        .catch((err: unknown) => {
+          if (!unmountedRef.current) {
+            setError(err instanceof Error ? err.message : 'Failed to fetch events')
+          }
+        })
+      return
+    }
+
     // Cancel any pending timer and fire immediately.
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current)
@@ -220,9 +260,47 @@ export function useAgreementEvents(agreementId: string | null) {
     }
     failureCount.current = 0
     void fetchEvents(new AbortController().signal)
-  }, [fetchEvents])
+  }, [fetchEvents, agreementId])
 
   return { events, isLoading, error, refetch }
+}
+
+/** Parses raw RPC-shaped events (from RPC or the indexer), newest first. */
+function toAgreementEvents(rawEvents: unknown[], agreementId: string): AgreementEvent[] {
+  const parsed: AgreementEvent[] = rawEvents
+    .filter(isValidEventResponse)
+    .map((e: RawEventResponse) => {
+      const eventType = parseEventType(e)
+      const eventData = parseEventData(e)
+      const id = (e as { id?: unknown }).id
+
+      return {
+        ...(typeof id === 'string' ? { id } : {}),
+        type: eventType,
+        ledger: e.ledger || 0,
+        txHash: e.txHash || '',
+        timestamp: e.ledgerClosedAt || new Date().toISOString(),
+        agreementId,
+        ...eventData,
+      }
+    })
+
+  // Sort by ledger descending (newest first)
+  parsed.sort((a, b) => b.ledger - a.ledger)
+  return parsed
+}
+
+function eventsOf(data: unknown): unknown[] {
+  const events = (data as { events?: unknown } | null)?.events
+  return Array.isArray(events) ? events : []
+}
+
+/** Adds relay deltas to the list, skipping any event already present. */
+function mergeEvents(prev: AgreementEvent[], fresh: AgreementEvent[]): AgreementEvent[] {
+  const seen = new Set(prev.map((e) => e.id).filter(Boolean))
+  const added = fresh.filter((e) => !e.id || !seen.has(e.id))
+  if (added.length === 0) return prev
+  return [...added, ...prev].sort((a, b) => b.ledger - a.ledger)
 }
 
 function parseEventType(event: RawEventResponse): string {

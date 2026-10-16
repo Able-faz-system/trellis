@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { xdr } from '@stellar/stellar-sdk'
-import { CONTRACT_ID, RPC_URL } from '../lib/config'
+import { CONTRACT_ID, RPC_URL, getIndexerUrl } from '../lib/config'
+import { openIndexerStream } from '../lib/indexer'
 
 export interface ContractStats {
   agreements: number
@@ -117,6 +118,19 @@ async function fetchEventCount(topicSymbol: string, signal: AbortSignal): Promis
 
 const POLL_INTERVAL_MS = 60_000
 
+function isContractStats(data: unknown): data is ContractStats {
+  const obj = data as Partial<ContractStats> | null
+  return typeof obj?.agreements === 'number' && typeof obj.milestonesLocked === 'number'
+}
+
+/**
+ * Landing-page contract statistics.
+ *
+ * With VITE_INDEXER_URL set, stats are pushed by the indexer relay whenever
+ * new events are indexed — counted over the indexer's full history rather
+ * than whatever the RPC node still retains. Without it (or if the relay is
+ * unreachable), each tab polls RPC every POLL_INTERVAL_MS while visible.
+ */
 export function useContractStats(): UseContractStatsResult {
   const [stats, setStats] = useState<ContractStats | null>(null)
   const [status, setStatus] = useState<StatsStatus>('loading')
@@ -167,6 +181,8 @@ export function useContractStats(): UseContractStatsResult {
 
     const controller = new AbortController()
     let interval: ReturnType<typeof setInterval> | null = null
+    let closeStream: (() => void) | null = null
+    let polling = false
 
     const startInterval = () => {
       if (interval !== null) return
@@ -188,12 +204,39 @@ export function useContractStats(): UseContractStatsResult {
       }
     }
 
-    fetchStats(controller.signal)
-    startInterval()
-    document.addEventListener('visibilitychange', handleVisibilityChange)
+    const startPolling = () => {
+      if (controller.signal.aborted || polling) return
+      polling = true
+      fetchStats(controller.signal)
+      startInterval()
+      document.addEventListener('visibilitychange', handleVisibilityChange)
+    }
+
+    if (getIndexerUrl()) {
+      closeStream = openIndexerStream(
+        '/stream/stats',
+        {
+          stats: (data) => {
+            if (controller.signal.aborted || polling || !isContractStats(data)) return
+            const next: ContractStats = {
+              agreements: data.agreements,
+              milestonesLocked: data.milestonesLocked,
+            }
+            statsRef.current = next
+            setStats(next)
+            setStatus('ok')
+            setLastUpdated(new Date().toISOString())
+          },
+        },
+        startPolling,
+      )
+    } else {
+      startPolling()
+    }
 
     return () => {
       controller.abort()
+      closeStream?.()
       stopInterval()
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
