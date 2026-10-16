@@ -1,0 +1,6 @@
+# Agreements whose ledger TTL the scheduled keeper (.github/workflows/ttl-keeper.yml)
+# renews. One 64-char hex agreement ID per line; `#` starts a comment.
+# See DEPLOYMENT.md ("Agreement TTL Keeper") before adding entries.
+
+# Verified test agreement (DEPLOYMENT.md "Verified Test Agreement").
+0101010101010101010101010101010101010101010101010101010101010101

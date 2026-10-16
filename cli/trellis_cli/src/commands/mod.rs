@@ -206,6 +206,25 @@ pub enum Commands {
         yes: bool,
     },
 
+    /// Renew an agreement's ledger TTL so an idle agreement is not archived.
+    ///
+    /// Any address may call this; the source account pays the rent. Intended
+    /// for keepers (see `scripts/ttl-keeper.sh`).
+    ExtendTtl {
+        /// Agreement ID (hex-encoded, 64 chars).
+        #[arg(long)]
+        agreement_id: String,
+
+        /// Address recorded as the caller in the `ttl_extended` event —
+        /// normally the public address of the signing source key.
+        #[arg(long)]
+        caller: String,
+
+        /// Skip the confirmation prompt (for scripting).
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Query the current state of an agreement.
     Status {
         /// Agreement ID (hex-encoded, 64 chars).
@@ -379,6 +398,12 @@ pub fn dispatch(cmd: Commands, config: &Config, opts: &OutputOpts) -> Result<(),
             milestone_id,
             yes,
         } => run_cancel_milestone(config, agreement_id, milestone_id, yes, opts),
+
+        Commands::ExtendTtl {
+            agreement_id,
+            caller,
+            yes,
+        } => run_extend_ttl(config, agreement_id, caller, yes, opts),
 
         Commands::Status { agreement_id } => run_status(config, agreement_id, opts),
 
@@ -851,6 +876,47 @@ fn run_cancel_milestone(
     ];
 
     execute(config, "cancel_unfunded_milestone", &args, opts)
+}
+
+/// `stellar contract invoke … -- extend_agreement_ttl …`
+///
+/// Final call signature:
+/// ```
+/// stellar contract invoke … -- extend_agreement_ttl
+///   --agreement-id <hex> --caller <G|C>
+/// ```
+///
+/// The contract requires no auth — `caller` is only recorded in the
+/// `ttl_extended` event — but the call is still a fee-paying transaction, so
+/// it goes through the same confirmation prompt as other submitting commands.
+fn run_extend_ttl(
+    config: &Config,
+    agreement_id: String,
+    caller: String,
+    yes: bool,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
+    validate_address("caller", &caller).unwrap_or_else(|e| fail_validation(&e));
+
+    confirm_action(
+        &format!("This will extend the ledger TTL of agreement {agreement_id} (rent paid by the source account)."),
+        yes,
+        opts,
+    )?;
+
+    execute(config, "extend_agreement_ttl", &build_extend_ttl_args(agreement_id, caller), opts)
+}
+
+/// Argument list for `extend_agreement_ttl`, split out so its shape can be
+/// unit-tested without touching the network.
+fn build_extend_ttl_args(agreement_id: String, caller: String) -> Vec<String> {
+    vec![
+        "--agreement-id".to_string(),
+        agreement_id,
+        "--caller".to_string(),
+        caller,
+    ]
 }
 
 /// `stellar contract invoke … -- get_agreement …`
@@ -1641,6 +1707,112 @@ mod tests {
         // '0', '1', '8', '9' and '=' are not in the RFC 4648 base32 alphabet
         assert!(validate_address("payer", &format!("G{}0", "A".repeat(54))).is_err());
         assert!(validate_address("payer", &format!("G{}=", "A".repeat(54))).is_err());
+    }
+
+    // --- extend-ttl command (#494) ---
+
+    #[derive(clap::Parser)]
+    struct ExtendTtlCli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[test]
+    fn extend_ttl_parses_from_argv() {
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        let caller = valid_g_addr();
+        let cli = ExtendTtlCli::try_parse_from([
+            "trellis",
+            "extend-ttl",
+            "--agreement-id",
+            &id,
+            "--caller",
+            &caller,
+            "-y",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::ExtendTtl {
+                agreement_id,
+                caller: c,
+                yes,
+            } => {
+                assert_eq!(agreement_id, id);
+                assert_eq!(c, caller);
+                assert!(yes);
+            }
+            other => panic!("parsed into the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extend_ttl_requires_caller() {
+        // The entrypoint takes `caller: Address`; omitting it would only fail
+        // later inside the stellar CLI with a less helpful message.
+        use clap::Parser;
+
+        let id = "a".repeat(64);
+        assert!(ExtendTtlCli::try_parse_from(["trellis", "extend-ttl", "--agreement-id", &id]).is_err());
+    }
+
+    #[test]
+    fn extend_ttl_args_shape() {
+        let id = "a".repeat(64);
+        let caller = valid_g_addr();
+        assert_eq!(
+            build_extend_ttl_args(id.clone(), caller.clone()),
+            vec![
+                "--agreement-id".to_string(),
+                id,
+                "--caller".to_string(),
+                caller,
+            ]
+        );
+    }
+
+    #[test]
+    fn extend_ttl_caller_rejects_injection() {
+        // `caller` is forwarded verbatim to `stellar contract invoke`, so it
+        // must go through the same strkey check as every other address flag.
+        assert!(validate_address("caller", "GAAAA --source attacker").is_err());
+        assert!(validate_address("caller", &format!("S{}", "A".repeat(55))).is_err());
+    }
+
+    #[test]
+    fn extend_ttl_unconfirmed_fails_closed_under_quiet() {
+        // A keeper running non-interactively without --yes must abort rather
+        // than hang on a prompt or silently submit.
+        let quiet = OutputOpts {
+            format: OutputFormat::Json,
+            quiet: true,
+            dry_run: false,
+        };
+        assert!(confirm_action("extend ttl", false, &quiet).is_err());
+        assert!(confirm_action("extend ttl", true, &quiet).is_ok());
+    }
+
+    #[test]
+    fn existing_cancel_milestone_still_parses() {
+        // Adjacent regression guard: the new subcommand must not disturb the
+        // neighbouring mutating command it was inserted after.
+        use clap::Parser;
+
+        let id = "c".repeat(64);
+        let cli = ExtendTtlCli::try_parse_from([
+            "trellis",
+            "cancel-milestone",
+            "--agreement-id",
+            &id,
+            "--milestone-id",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::CancelMilestone { milestone_id: 1, .. }
+        ));
     }
 
     // --- validate_agreement_id ---

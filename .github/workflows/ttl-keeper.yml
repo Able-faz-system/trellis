@@ -1,0 +1,81 @@
+name: TTL Keeper
+
+# Minimal keeper for `extend_agreement_ttl` (#494). Renews the ledger TTL of
+# every agreement listed in .github/keeper-agreements.txt so idle agreements
+# are not archived. A stopgap, not a production keeper network — see
+# DEPLOYMENT.md ("Agreement TTL Keeper") for assumptions and limitations.
+
+on:
+  schedule:
+    # Weekly, Wednesdays 05:00 UTC. Mutating calls renew the TTL to ~30 days,
+    # so a weekly run leaves several missed runs of headroom.
+    - cron: '0 5 * * 3'
+  workflow_dispatch:
+    inputs:
+      agreement_ids:
+        description: 'Override: comma-separated agreement IDs (blank = use .github/keeper-agreements.txt)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ttl-keeper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  extend-ttl:
+    name: Extend agreement TTLs
+    runs-on: ubuntu-latest
+    # The keeper needs a funded signing key. Forks and repos that have not
+    # configured one skip cleanly instead of failing every week.
+    if: ${{ vars.TRELLIS_KEEPER_ADDRESS != '' }}
+
+    env:
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+      STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
+      TRELLIS_CONTRACT_ID: ${{ vars.TRELLIS_CONTRACT_ID || 'CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q' }}
+      TRELLIS_SOURCE_KEY: ${{ secrets.TRELLIS_KEEPER_SECRET_KEY }}
+      TRELLIS_KEEPER_CALLER: ${{ vars.TRELLIS_KEEPER_ADDRESS }}
+      TRELLIS_KEEPER_AGREEMENT_IDS: ${{ github.event.inputs.agreement_ids }}
+      TRELLIS_BIN: target/release/trellis
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install stellar CLI
+        run: |
+          curl -sL -o stellar-cli.tar.gz https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf stellar-cli.tar.gz
+          sudo mv stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Build trellis CLI
+        run: cargo build --release --manifest-path=cli/trellis_cli/Cargo.toml
+
+      - name: Extend TTLs
+        run: |
+          set -o pipefail
+          scripts/ttl-keeper.sh 2>&1 | tee keeper.log
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "### TTL keeper"
+            echo
+            echo '```'
+            tail -n 40 keeper.log 2>/dev/null || echo "(no log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
