@@ -641,6 +641,8 @@ export STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 export TRELLIS_CONTRACT_ID="CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q"
 export TRELLIS_SOURCE_KEY="<your stellar identity name>"
+# Or, for a raw S… secret, keep it in a 0600 file instead of the environment:
+# export TRELLIS_SOURCE_KEY_FILE=~/.trellis.key   (or pass --source-key-file)
 
 # Create a new agreement
 trellis init \
@@ -715,6 +717,57 @@ encoded to Soroban `ScVal` natively by the CLI, matching the contract's
 
 `--json` takes priority over `--human-readable` when both are passed.
 
+`--source-key-file <PATH>` (or `TRELLIS_SOURCE_KEY_FILE`) reads the signing key
+from a file and takes precedence over `TRELLIS_SOURCE_KEY`. See
+[DEPLOYMENT.md](./DEPLOYMENT.md#keeping-a-raw-secret-key-out-of-the-environment)
+for details.
+
+`--as payer|payee|resolver` signs with that role's key from
+`TRELLIS_PAYER_KEY` / `TRELLIS_PAYEE_KEY` / `TRELLIS_RESOLVER_KEY` (or the
+matching `*_KEY_FILE` variables). Keep all three in `.env` instead of
+re-exporting `TRELLIS_SOURCE_KEY` between commands:
+
+```bash
+trellis --as payee submit-work --agreement-id <hex-id> --milestone-id 0
+```
+
+#### Inspecting the Resolved Configuration
+
+`trellis config` prints the configuration the CLI actually resolved from
+flags, env vars and `.env`, without making any RPC call. It shows the network
+preset, RPC URL, passphrase, contract ID, the source key and where it came
+from, and whether the `stellar` binary is on `PATH`:
+
+```bash
+trellis config                       # key: value lines
+trellis config --human-readable      # colorized
+trellis config --json                # {"status", "result": {...}, ...}
+trellis --network futurenet config   # preview another preset
+```
+
+A raw `S…` secret seed is never printed. It is masked as `S...***`. Named
+`stellar keys` identities (e.g. `alice`) are not secret and are shown in
+full. The command exits `1` and lists the problems if any other command would
+reject this configuration, so it also works as a preflight check in scripts.
+
+#### Agreement History
+
+Every successful `init`, `status` and `milestone-status` call records the
+agreement ID (with its contract ID and a timestamp) in
+`~/.trellis/history.json`, so you don't have to keep track of 64-char hex IDs
+yourself:
+
+```bash
+trellis history              # table, most recent first
+trellis history --limit 5
+trellis history --json       # {"status": "success", "result": [ ... ], ...}
+trellis history --clear      # delete the cache
+```
+
+`--dry-run` calls are not recorded. Only public on-chain identifiers are
+stored, never keys. Set `TRELLIS_HISTORY_FILE` to use a different file, or
+`TRELLIS_NO_HISTORY=1` to turn recording off. If the cache can't be written,
+the CLI prints a warning but the command itself still succeeds.
 #### Network Passphrase Verification
 
 Before any command runs, the CLI calls the configured RPC endpoint's `getNetwork`

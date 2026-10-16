@@ -107,6 +107,65 @@ export TRELLIS_CONTRACT_ID="<your contract ID>"
 export TRELLIS_SOURCE_KEY="<your stellar identity name>"
 ```
 
+#### Keeping a raw secret key out of the environment
+
+If you sign with a raw `S…` secret seed instead of a named `stellar keys`
+identity, put it in a file instead of exporting it. Environment variables
+end up in `/proc/<pid>/environ`, shell history and `.env` files:
+
+```bash
+umask 077
+printf '%s\n' 'S...your-secret...' > ~/.trellis-payer.key   # mode 0600
+
+export TRELLIS_SOURCE_KEY_FILE=~/.trellis-payer.key
+# or per invocation:
+trellis --source-key-file ~/.trellis-payer.key status --agreement-id <hex>
+```
+
+The source key is resolved in this order (first match wins):
+
+1. `--source-key-file <PATH>`
+2. `TRELLIS_SOURCE_KEY_FILE`
+3. `TRELLIS_SOURCE_KEY`
+
+A configured key file always wins. If `TRELLIS_SOURCE_KEY` is also set, the
+CLI prints a note saying it was ignored. If a configured key file is missing
+or empty, the command fails instead of falling back to `TRELLIS_SOURCE_KEY`.
+On Linux/macOS a warning is printed when the key file is readable by the
+group or other users (anything other than `0600`/`0400`). Whitespace and a
+trailing newline around the key are trimmed.
+
+#### One config for every role (`--as`)
+
+Escrow commands have to be signed by different parties: the payer, the payee
+or the dispute resolver. You don't need to re-export `TRELLIS_SOURCE_KEY`
+before each one. Put all three identities in `.env` and pick one per command
+with `--as`:
+
+```bash
+# .env
+TRELLIS_PAYER_KEY=trellis-payer          # stellar identity name or S… seed
+TRELLIS_PAYEE_KEY=trellis-payee
+TRELLIS_RESOLVER_KEY=trellis-resolver
+# Or point at key files instead (they take precedence over the *_KEY vars):
+# TRELLIS_PAYER_KEY_FILE=~/.trellis-payer.key
+```
+
+```bash
+trellis --as payer lock-funds --agreement-id <hex> --milestone-id 0
+```
+
+| `--as`     | Key file variable (checked first) | Key variable           |
+|------------|-----------------------------------|------------------------|
+| `payer`    | `TRELLIS_PAYER_KEY_FILE`          | `TRELLIS_PAYER_KEY`    |
+| `payee`    | `TRELLIS_PAYEE_KEY_FILE`          | `TRELLIS_PAYEE_KEY`    |
+| `resolver` | `TRELLIS_RESOLVER_KEY_FILE`       | `TRELLIS_RESOLVER_KEY` |
+
+If the chosen role's variables aren't set, `--as` fails. It never falls back
+to `TRELLIS_SOURCE_KEY`, so a missing entry can't make a command sign with
+the wrong identity. Without `--as`, the CLI uses `TRELLIS_SOURCE_KEY` exactly
+as before. `--as` cannot be combined with `--source-key-file`.
+
 ### Step 5 — Build the CLI
 
 ```bash
@@ -124,7 +183,7 @@ Binary will be at `target/release/trellis.exe` (Windows) or
 ### Create an agreement
 
 ```bash
-trellis init \
+trellis --as payer init \
   --agreement-id <64-char hex string> \
   --payer <payer G... address> \
   --payee <payee G... address> \
@@ -145,21 +204,21 @@ trellis status --agreement-id <hex>
 ### Fund a milestone
 
 ```bash
-trellis lock-funds --agreement-id <hex> --milestone-id 0
+trellis --as payer lock-funds --agreement-id <hex> --milestone-id 0
 ```
 
-> Must be signed by the payer identity (`TRELLIS_SOURCE_KEY=trellis-payer`)
+> Must be signed by the payer identity (`--as payer`)
 
 ### Submit work proof
 
 ```bash
-trellis submit-work \
+trellis --as payee submit-work \
   --agreement-id <hex> \
   --milestone-id 0 \
   --proof-uri "ipfs://your-proof-hash"
 ```
 
-> Must be signed by the payee identity
+> Must be signed by the payee identity (`--as payee`)
 
 `--proof-uri` is optional — omit it to mark the milestone submitted without a
 proof link. Do not pass an empty string: the contract stores `proof_uri` as an
@@ -170,21 +229,22 @@ The web UI follows the same rule: leaving the Proof URI field blank submits
 ### Approve and release payment
 
 ```bash
-trellis approve-release --agreement-id <hex> --milestone-id 0
+trellis --as payer approve-release --agreement-id <hex> --milestone-id 0
 ```
 
-> Must be signed by the payer identity
+> Must be signed by the payer identity (`--as payer`)
 
 ### Raise a dispute
 
 ```bash
-trellis raise-dispute \
+trellis --as payer raise-dispute \
   --agreement-id <hex> \
   --milestone-id 0 \
-  --caller <payer or payee address>
+  --caller <payer address>
 ```
 
-> Can be called by either the payer or the payee
+> Can be called by either the payer or the payee. Use `--as payee` with the
+> payee's address as `--caller` to raise it from the payee side.
 
 In the web UI, the Dispute button only appears when the connected wallet is the
 agreement's payer or payee; any other wallet sees an explanatory note instead.
@@ -192,23 +252,23 @@ agreement's payer or payee; any other wallet sees an explanatory note instead.
 ### Resolve a dispute
 
 ```bash
-trellis resolve-dispute \
+trellis --as resolver resolve-dispute \
   --agreement-id <hex> \
   --milestone-id 0 \
   --refund-to-payer true
 ```
 
-> Must be signed by the dispute resolver identity.
+> Must be signed by the dispute resolver identity (`--as resolver`).
 > `--refund-to-payer true` returns funds to payer.
 > `--refund-to-payer false` releases funds to payee.
 
 ### Cancel an unfunded milestone
 
 ```bash
-trellis cancel-milestone --agreement-id <hex> --milestone-id 0
+trellis --as payer cancel-milestone --agreement-id <hex> --milestone-id 0
 ```
 
-> Must be signed by the payer. Only works on milestones still in `Pending` status.
+> Must be signed by the payer (`--as payer`). Only works on milestones still in `Pending` status.
 
 ### Check RPC connectivity
 
@@ -412,9 +472,10 @@ the path once the JS bundle loads.
 ## Known Issues & Notes
 
 - **Auth per command:** Each CLI command must be signed by the correct identity.
-  Change `TRELLIS_SOURCE_KEY` to match the required signer per operation
-  (payer for `init`, `lock-funds`, `approve-release`; payee for `submit-work`;
-  resolver for `resolve-dispute`).
+  Pass `--as payer|payee|resolver` to pick the required signer per operation
+  (payer for `init`, `lock-funds`, `approve-release`, `cancel-milestone`; payee
+  for `submit-work`; resolver for `resolve-dispute`). See
+  [One config for every role](#one-config-for-every-role---as).
 
 - **WASM build target:** Use `wasm32-unknown-unknown` via `cargo rustc` rather
   than `stellar contract build` until the project upgrades to a toolchain that

@@ -2227,6 +2227,7 @@ mod tests {
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             contract_id: "CAABC123".to_string(),
             source_key: source_key.to_string(),
+            source_key_origin: "TRELLIS_SOURCE_KEY",
         }
     }
 

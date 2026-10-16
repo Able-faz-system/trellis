@@ -3,7 +3,7 @@ use std::io::IsTerminal as _;
 use clap::Subcommand;
 use clap_complete::Shell;
 
-use crate::config::Config;
+use crate::config::{Config, Network};
 use crate::rpc::{InvokeOutput, RpcClient};
 use crate::xdr_decode::{decode_agreement, decode_milestone};
 
@@ -332,6 +332,28 @@ pub enum Commands {
     /// Manage Stellar secret keys securely using OS keychain or encrypted keystore.
     #[command(subcommand)]
     Keys(KeysSubcommand),
+
+    /// Print the configuration the CLI resolved (network, RPC URL, contract
+    /// ID, masked source key) without touching the network.
+    ///
+    /// Exits non-zero when the configuration would be rejected by any other
+    /// command, so it can be used as a preflight check in scripts.
+    Config,
+
+    /// List agreement IDs from previous successful `init`, `status` and
+    /// `milestone-status` calls, most recent first.
+    ///
+    /// Stored in ~/.trellis/history.json (override with TRELLIS_HISTORY_FILE;
+    /// set TRELLIS_NO_HISTORY=1 to stop recording).
+    History {
+        /// Show at most this many entries.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Delete the history file instead of listing it.
+        #[arg(long, conflicts_with = "limit")]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -473,6 +495,14 @@ pub fn dispatch(cmd: Commands, config: &Config, opts: &OutputOpts) -> Result<(),
         // Handled in main() before dispatch is ever reached — completions
         // need the clap `Command` object, not a `Config`.
         Commands::Completion { .. } => Ok(()),
+
+        // Also handled in main(): it must run before the startup checks that
+        // would exit on exactly the misconfiguration it exists to diagnose.
+        Commands::Config => Ok(()),
+
+        // Handled in main() too: reading a local file needs neither a valid
+        // contract/key config nor the stellar binary.
+        Commands::History { .. } => Ok(()),
 
         Commands::Keys(subcmd) => run_keys(subcmd),
     }
@@ -647,6 +677,7 @@ fn run_init(
     validate_address("payee", &payee).unwrap_or_else(|e| fail_validation(&e));
     validate_address("token", &token).unwrap_or_else(|e| fail_validation(&e));
     validate_address("resolver", &resolver).unwrap_or_else(|e| fail_validation(&e));
+    let agreement_id_for_history = agreement_id.clone();
 
     let milestones_json = build_milestones_json(&milestones_csv).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
@@ -677,7 +708,9 @@ fn run_init(
         resolver,
     ];
 
-    execute(config, "init", &args, opts)
+    execute(config, "init", &args, opts)?;
+    record_history(config, &agreement_id_for_history, "init", opts);
+    Ok(())
 }
 
 /// `stellar contract invoke … -- lock_funds …`
@@ -921,9 +954,11 @@ fn run_cancel_milestone(
 fn run_status(config: &Config, agreement_id: String, opts: &OutputOpts) -> Result<(), String> {
     validate_agreement_id(&agreement_id).unwrap_or_else(|e| fail_validation(&e));
 
-    let args = vec!["--agreement-id".to_string(), agreement_id];
+    let args = vec!["--agreement-id".to_string(), agreement_id.clone()];
 
-    execute(config, "get_agreement", &args, opts)
+    execute(config, "get_agreement", &args, opts)?;
+    record_history(config, &agreement_id, "status", opts);
+    Ok(())
 }
 
 /// `stellar contract invoke … -- get_milestone …`
@@ -969,12 +1004,200 @@ fn run_milestone_status(
 fn milestone_status_args(agreement_id: &str, milestone_id: u32) -> Vec<String> {
     vec![
         "--agreement-id".to_string(),
+        agreement_id.clone(),
         agreement_id.to_string(),
         "--milestone-id".to_string(),
         milestone_id.to_string(),
     ]
 }
 
+    execute(config, "get_milestone", &args, opts)?;
+    record_history(config, &agreement_id, "milestone-status", opts);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `trellis history` — local agreement-history cache (#484)
+// ---------------------------------------------------------------------------
+
+/// Record `agreement_id` in the local history after a successful call.
+/// `--dry-run` previews never reach the chain, so they are not recorded.
+fn record_history(config: &Config, agreement_id: &str, command: &str, opts: &OutputOpts) {
+    if !opts.dry_run {
+        crate::history::record(&config.contract_id, agreement_id, command, opts.quiet);
+    }
+}
+
+/// List (or, with `clear`, delete) the history file at `path`.
+///
+/// `--json` / `--quiet` print the CLI's usual envelope with the entries as
+/// the `result` array; raw and `--human-readable` print a table.
+pub fn run_history(
+    path: Option<&std::path::Path>,
+    limit: Option<usize>,
+    clear: bool,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Err(
+            "Error: agreement history is disabled (TRELLIS_NO_HISTORY is set) or no home \
+             directory was found; set TRELLIS_HISTORY_FILE to choose a location."
+                .to_string(),
+        );
+    };
+
+    if clear {
+        crate::history::clear(path).map_err(|e| format!("Error: {e}"))?;
+        match opts.format {
+            OutputFormat::Json => println!("{}", history_envelope(serde_json::json!([]))),
+            _ => println!("Cleared agreement history ({}).", path.display()),
+        }
+        return Ok(());
+    }
+
+    let mut entries = crate::history::load(path).map_err(|e| format!("Error: {e}"))?;
+    if let Some(n) = limit {
+        entries.truncate(n);
+    }
+
+    match opts.format {
+        OutputFormat::Json => {
+            println!("{}", history_envelope(crate::history::entries_json(&entries)));
+        }
+        OutputFormat::Raw | OutputFormat::Human => {
+            print!("{}", crate::history::format_table(&entries));
+        }
+    }
+    Ok(())
+}
+
+/// The standard `{status, result, tx_hash, events, error}` JSON envelope
+/// around a history result.
+fn history_envelope(result: serde_json::Value) -> String {
+    serde_json::json!({
+        "status": "success",
+        "result": result,
+        "tx_hash": null,
+        "events": null,
+        "error": null,
+    })
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// `trellis config` — resolved-configuration introspection (#485)
+// ---------------------------------------------------------------------------
+
+/// Build the report printed by `trellis config`.
+///
+/// The source key goes through [`Config::masked_source_key`], so a raw `S…`
+/// seed is never printed. Validation problems are included rather than
+/// aborting, because seeing them is the point of the command.
+pub fn config_report(
+    network: Network,
+    config: &Config,
+    stellar_cli_found: bool,
+) -> serde_json::Value {
+    use clap::ValueEnum;
+
+    let network_name = network
+        .to_possible_value()
+        .map(|v| v.get_name().to_string())
+        .unwrap_or_default();
+    let contract_id =
+        (config.contract_id != "UNSET_CONTRACT_ID").then(|| config.contract_id.clone());
+    let problems = config.validate().err().unwrap_or_default();
+
+    serde_json::json!({
+        "network": network_name,
+        "rpc_url": config.rpc_url,
+        "network_passphrase": config.network_passphrase,
+        "contract_id": contract_id,
+        "source_key": config.masked_source_key(),
+        "source_key_origin": config.source_key_origin,
+        "stellar_cli_found": stellar_cli_found,
+        "valid": problems.is_empty() && stellar_cli_found,
+        "problems": problems,
+    })
+}
+
+/// Print the `trellis config` report in the selected output format.
+///
+/// `--json` / `--quiet` emit the CLI's usual envelope with the report as
+/// `result`. Raw and `--human-readable` both print one `key: value` line per
+/// field; human mode adds color. Returns `Err("")` (exit 1, nothing extra
+/// printed) when the configuration is invalid or `stellar` is missing.
+pub fn run_config(
+    network: Network,
+    config: &Config,
+    stellar_cli_found: bool,
+    opts: &OutputOpts,
+) -> Result<(), String> {
+    let report = config_report(network, config, stellar_cli_found);
+    let valid = report["valid"].as_bool().unwrap_or(false);
+
+    match opts.format {
+        OutputFormat::Json => {
+            let envelope = serde_json::json!({
+                "status": if valid { "success" } else { "error" },
+                "result": report,
+                "tx_hash": null,
+                "events": null,
+                "error": if valid { None } else { Some("invalid configuration") },
+            });
+            println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
+        }
+        OutputFormat::Raw | OutputFormat::Human => {
+            print!("{}", format_config_report(&report, opts.format == OutputFormat::Human));
+        }
+    }
+
+    if valid {
+        Ok(())
+    } else {
+        Err(String::new())
+    }
+}
+
+/// Plain-text rendering of a [`config_report`], one field per line.
+fn format_config_report(report: &serde_json::Value, color: bool) -> String {
+    let (bold, green, red, reset) = if color {
+        (ANSI_BOLD, ANSI_GREEN, ANSI_RED, ANSI_RESET)
+    } else {
+        ("", "", "", "")
+    };
+    let field = |key: &str| match &report[key] {
+        serde_json::Value::Null => "(not set)".to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    let mut out = String::new();
+    for (label, key) in [
+        ("network", "network"),
+        ("rpc url", "rpc_url"),
+        ("network passphrase", "network_passphrase"),
+        ("contract id", "contract_id"),
+        ("source key", "source_key"),
+        ("source key from", "source_key_origin"),
+        ("stellar cli found", "stellar_cli_found"),
+    ] {
+        out.push_str(&format!("{bold}{label:<19}{reset}{}\n", field(key)));
+    }
+
+    let problems = report["problems"].as_array().cloned().unwrap_or_default();
+    if report["valid"].as_bool().unwrap_or(false) {
+        out.push_str(&format!("{green}{bold}\u{2714} configuration OK{reset}\n"));
+    } else {
+        out.push_str(&format!("{red}{bold}\u{2718} configuration invalid{reset}\n"));
+        for p in problems {
+            out.push_str(&format!("  - {}\n", p.as_str().unwrap_or_default()));
+        }
+        if report["stellar_cli_found"] == false {
+            out.push_str("  - `stellar` CLI not found in PATH\n");
+        }
+    }
+    out
 /// Native connectivity probe: `getHealth`, then `getLatestLedger`.
 ///
 /// Talks to `config.rpc_url` directly over HTTP rather than through
@@ -2214,6 +2437,164 @@ mod tests {
         }
     }
 
+    // --- trellis config (#485) ---
+
+    fn test_config(contract_id: &str, source_key: &str) -> Config {
+        Config {
+            rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            contract_id: contract_id.to_string(),
+            source_key: source_key.to_string(),
+            source_key_origin: "TRELLIS_SOURCE_KEY",
+        }
+    }
+
+    fn good_contract_id() -> String {
+        format!("C{}", "A".repeat(55))
+    }
+
+    #[test]
+    fn config_report_masks_secret_seed() {
+        let seed = format!("S{}", "Q".repeat(55));
+        let cfg = test_config(&good_contract_id(), &seed);
+        let report = config_report(Network::Testnet, &cfg, true);
+        assert_eq!(report["source_key"], "S...***");
+        let rendered = report.to_string() + &format_config_report(&report, true);
+        assert!(!rendered.contains(&seed), "seed leaked: {rendered}");
+    }
+
+    #[test]
+    fn config_report_valid_config() {
+        let report = config_report(
+            Network::Futurenet,
+            &test_config(&good_contract_id(), "alice"),
+            true,
+        );
+        assert_eq!(report["network"], "futurenet");
+        assert_eq!(report["source_key"], "alice");
+        assert_eq!(report["source_key_origin"], "TRELLIS_SOURCE_KEY");
+        assert_eq!(report["valid"], true);
+        assert_eq!(report["problems"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn config_report_lists_problems_instead_of_failing() {
+        let report = config_report(
+            Network::Testnet,
+            &test_config("UNSET_CONTRACT_ID", "UNSET_SOURCE_KEY"),
+            true,
+        );
+        assert_eq!(report["valid"], false);
+        assert_eq!(report["contract_id"], serde_json::Value::Null);
+        assert_eq!(report["source_key"], serde_json::Value::Null);
+        let problems = report["problems"].as_array().unwrap();
+        assert!(problems.contains(&serde_json::json!("TRELLIS_CONTRACT_ID")));
+        assert!(problems.contains(&serde_json::json!("TRELLIS_SOURCE_KEY")));
+    }
+
+    #[test]
+    fn config_report_invalid_when_stellar_cli_missing() {
+        let report = config_report(
+            Network::Testnet,
+            &test_config(&good_contract_id(), "alice"),
+            false,
+        );
+        assert_eq!(report["valid"], false);
+        assert!(format_config_report(&report, false).contains("`stellar` CLI not found"));
+    }
+
+    #[test]
+    fn format_config_report_plain_has_no_ansi_and_shows_unset() {
+        let report = config_report(
+            Network::Testnet,
+            &test_config("UNSET_CONTRACT_ID", "alice"),
+            true,
+        );
+        let text = format_config_report(&report, false);
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(text.contains("contract id        (not set)"), "{text}");
+        assert!(text.contains("configuration invalid"));
+    }
+
+    #[test]
+    fn run_config_returns_err_for_invalid_config_in_every_format() {
+        let cfg = test_config("UNSET_CONTRACT_ID", "alice");
+        for f in [OutputFormat::Raw, OutputFormat::Json, OutputFormat::Human] {
+            assert_eq!(run_config(Network::Testnet, &cfg, true, &opts(f)), Err(String::new()));
+        }
+        let ok = test_config(&good_contract_id(), "alice");
+        assert!(run_config(Network::Testnet, &ok, true, &opts(OutputFormat::Json)).is_ok());
+    }
+
+    // --- trellis history (#484) ---
+
+    fn history_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trellis-history-cmd-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        dir.join("history.json")
+    }
+
+    #[test]
+    fn history_envelope_matches_standard_shape() {
+        let v: serde_json::Value =
+            serde_json::from_str(&history_envelope(serde_json::json!([1]))).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["result"], serde_json::json!([1]));
+        assert!(v["error"].is_null() && v["tx_hash"].is_null() && v["events"].is_null());
+    }
+
+    #[test]
+    fn run_history_lists_in_every_format() {
+        let path = history_path("list");
+        crate::history::record_at(&path, "CTEST", &"a".repeat(64), "init", 1).unwrap();
+        for f in [OutputFormat::Raw, OutputFormat::Json, OutputFormat::Human] {
+            assert!(run_history(Some(&path), None, false, &opts(f)).is_ok(), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn run_history_empty_and_missing_file_is_ok() {
+        let path = history_path("empty");
+        assert!(run_history(Some(&path), Some(5), false, &opts(OutputFormat::Json)).is_ok());
+    }
+
+    #[test]
+    fn run_history_clear_removes_file() {
+        let path = history_path("clear");
+        crate::history::record_at(&path, "CTEST", &"a".repeat(64), "init", 1).unwrap();
+        run_history(Some(&path), None, true, &opts(OutputFormat::Raw)).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_history_disabled_is_error() {
+        let err = run_history(None, None, false, &opts(OutputFormat::Raw)).unwrap_err();
+        assert!(err.contains("TRELLIS_HISTORY_FILE"), "got: {err}");
+    }
+
+    #[test]
+    fn dry_run_is_not_recorded() {
+        // record_history must short-circuit before touching the default path,
+        // so a dry run leaves no trace even if HOME is writable.
+        let cfg = Config {
+            rpc_url: "https://soroban-testnet.stellar.org".to_string(),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            contract_id: "CTEST".to_string(),
+            source_key: "alice".to_string(),
+            source_key_origin: "TRELLIS_SOURCE_KEY",
+        };
+        let dry = OutputOpts {
+            format: OutputFormat::Raw,
+            quiet: true,
+            dry_run: true,
+        };
+        let before = crate::history::default_path().and_then(|p| std::fs::read(p).ok());
+        record_history(&cfg, &"d".repeat(64), "status", &dry);
+        let after = crate::history::default_path().and_then(|p| std::fs::read(p).ok());
+        assert_eq!(before, after);
     // --- Secret-key redaction in command_debug (#411) ----------------------
     //
     // render_raw and render_human both print `out.command_debug` on failure.
