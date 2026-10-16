@@ -148,6 +148,9 @@ pub struct OutputOpts {
     pub quiet: bool,
     /// Print the `stellar contract invoke` command instead of executing it.
     pub dry_run: bool,
+    /// RPC tracing level from repeated `-v` flags (0 = off). Always 0 under
+    /// `--quiet`.
+    pub verbose: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +992,8 @@ fn run_health(config: &Config, opts: &OutputOpts) -> Result<(), String> {
 
     if opts.dry_run {
         let out = InvokeOutput {
-            stdout: command_debug.clone(),
+            stdout: exit_code: None,
+ command_debug.clone(),
             stderr: String::new(),
             success: true,
             command_debug,
@@ -1002,6 +1006,7 @@ fn run_health(config: &Config, opts: &OutputOpts) -> Result<(), String> {
             stdout: String::new(),
             stderr: e,
             success: false,
+            exit_code: None,
             command_debug,
         },
         Ok(health) if !health.is_healthy() => InvokeOutput {
@@ -1011,6 +1016,7 @@ fn run_health(config: &Config, opts: &OutputOpts) -> Result<(), String> {
                 config.rpc_url, health.status
             ),
             success: false,
+            exit_code: None,
             command_debug,
         },
         Ok(health) => match RpcClient::get_latest_ledger(config) {
@@ -1019,12 +1025,14 @@ fn run_health(config: &Config, opts: &OutputOpts) -> Result<(), String> {
                     .to_string(),
                 stderr: String::new(),
                 success: true,
+                exit_code: None,
                 command_debug,
             },
             Err(e) => InvokeOutput {
                 stdout: String::new(),
                 stderr: e,
                 success: false,
+                exit_code: None,
                 command_debug,
             },
         },
@@ -1239,12 +1247,13 @@ fn execute(
             stdout: preview.clone(),
             stderr: String::new(),
             success: true,
+            exit_code: None,
             command_debug: preview,
         };
         return render_output(&out, opts);
     }
 
-    let out = RpcClient::invoke(config, fn_name, args, opts.quiet);
+    let out = RpcClient::invoke(config, fn_name, args, opts.quiet, opts.verbose);
     render_output(&out, opts)
 }
 
@@ -1886,6 +1895,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: String::new(),
             success: true,
+            exit_code: Some(0),
             command_debug: "stellar contract invoke ...".to_string(),
         }
     }
@@ -1895,6 +1905,7 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             success: false,
+            exit_code: Some(1),
             command_debug: "stellar contract invoke --id CAABC -- boom".to_string(),
         }
     }
@@ -1998,6 +2009,7 @@ mod tests {
             format: OutputFormat::Raw,
             quiet: false,
             dry_run: false,
+            verbose: 0,
         }
     }
 
@@ -2006,6 +2018,7 @@ mod tests {
             format: OutputFormat::Json,
             quiet: true,
             dry_run: false,
+            verbose: 0,
         }
     }
 
@@ -2014,6 +2027,7 @@ mod tests {
             format: OutputFormat::Raw,
             quiet: false,
             dry_run: true,
+            verbose: 0,
         }
     }
 
@@ -2192,6 +2206,7 @@ mod tests {
             format,
             quiet: false,
             dry_run: false,
+            verbose: 0,
         }
     }
 
@@ -2238,6 +2253,7 @@ mod tests {
             stdout: String::new(),
             stderr: "simulated RPC failure".to_string(),
             success: false,
+            exit_code: None,
             command_debug,
         }
     }
@@ -2297,6 +2313,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             success: false,
+            exit_code: None,
             command_debug: "STELLAR_SECRET_KEY=<redacted> stellar contract invoke --id CAABC -- init".to_string(),
         };
         let err = render_raw(&out).unwrap_err();
@@ -2314,6 +2331,7 @@ mod tests {
             stdout: String::new(),
             stderr: "error: account not found".to_string(),
             success: false,
+            exit_code: None,
             command_debug: format!("STELLAR_SECRET_KEY=<redacted> stellar contract invoke --id CAABC -- init"),
         };
         // The seed must not appear in command_debug at all.
@@ -2333,6 +2351,7 @@ mod tests {
             stdout: preview.to_string(),
             stderr: String::new(),
             success: true,
+            exit_code: None,
             command_debug: preview.to_string(),
         }
     }
@@ -2343,6 +2362,7 @@ mod tests {
             format,
             quiet: false,
             dry_run: true,
+            verbose: 0,
         }
     }
 
@@ -2395,6 +2415,7 @@ mod tests {
             format: OutputFormat::Json, // quiet forces Json in dispatch
             quiet: true,
             dry_run: true,
+            verbose: 0,
         };
         assert!(render_output(&out, &opts).is_ok());
         // Verify the envelope shape independently.
@@ -2419,6 +2440,7 @@ mod tests {
             format: OutputFormat::Json,
             quiet: false,
             dry_run: true,
+            verbose: 0,
         };
         let result = execute(&config, "init", &[], &opts);
         assert!(result.is_ok(), "execute dry-run --json must return Ok, got: {result:?}");

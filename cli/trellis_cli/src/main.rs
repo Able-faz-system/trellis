@@ -11,7 +11,7 @@ mod utils;
 #[path = "../sdk_compat.rs"]
 mod sdk_compat;
 
-use clap::{CommandFactory, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use commands::{Commands, OutputFormat, OutputOpts};
 use config::Network;
 use std::path::{Path, PathBuf};
@@ -111,6 +111,13 @@ struct Cli {
     /// executing it or submitting anything on-chain.
     #[arg(long, global = true)]
     dry_run: bool,
+
+    /// Trace RPC attempts to stderr for debugging retry behavior. `-v` shows
+    /// each attempt's exit code, full error output and why retrying stopped;
+    /// `-vv` also prints the full (secret-redacted) command and per-attempt
+    /// timing. Ignored under `--quiet`.
+    #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
+    verbose: u8,
 
     /// Allow a cleartext `http://` RPC endpoint for a non-localhost host.
     ///
@@ -351,6 +358,8 @@ fn main() {
         format,
         quiet: cli.quiet,
         dry_run: cli.dry_run,
+        // --quiet promises nothing but the final JSON result, so it wins.
+        verbose: if cli.quiet { 0 } else { cli.verbose },
     };
 
     // ── #67: Propagate errors from dispatch; exit(1) only in main ─────────
