@@ -252,6 +252,32 @@ resolving.
 
 ### How to tell testnet was reset
 
+A scheduled workflow checks this for you. [`Testnet Health`](.github/workflows/testnet-health.yml)
+runs daily (07:00 UTC, or on demand via **Actions → Testnet Health → Run
+workflow**) and calls `trellis status` against the
+[Live Contract](#live-contract) and [Verified Test Agreement](#verified-test-agreement):
+
+- **Reset detected** — the contract or agreement no longer exists on-chain
+  (e.g. `Error(Contract, #3)` / `AgreementNotFound`, or a missing contract
+  instance). The workflow opens an issue labelled `testnet-reset`, or comments
+  on the existing open one, and the run fails. Check for that issue before
+  debugging "agreement not found" yourself.
+- **Inconclusive** — the probe failed for another reason (RPC outage,
+  Friendbot down, build failure). The run fails so it is visible, but no issue
+  is filed, so a flaky RPC never raises a false reset alarm.
+- **Healthy** — any open `testnet-reset` issue is closed automatically.
+
+Each run's probe output is in its job summary. The same check runs locally:
+
+```bash
+TRELLIS_CONTRACT_ID=<contract ID> TRELLIS_SOURCE_KEY=<identity> \
+  TRELLIS_BIN=target/release/trellis ./scripts/check-testnet-health.sh [agreement ID]
+```
+
+It exits `0` (healthy), `10` (reset suspected) or `1` (inconclusive).
+
+Signs you can check manually:
+
 - `trellis status --agreement-id <any known ID>` returns `agreement not found`
   even though the ID was previously valid.
 - The contract ID no longer resolves on
@@ -266,9 +292,14 @@ resolving.
    (`frontend/.env`) to the new contract ID.
 3. Create a fresh test agreement with `trellis init` (see
    [CLI Usage](#cli-usage)) and note the new agreement ID for testing.
-4. Optionally run `scripts/reset-testnet.sh`, which automates steps 1–3: it
+4. Update `LIVE_CONTRACT_ID` and `LIVE_AGREEMENT_ID` in
+   `.github/workflows/testnet-health.yml` (along with the IDs in this file)
+   so the daily probe checks the new deployment; the `testnet-reset` issue
+   closes itself on the next passing run.
+5. Optionally run `scripts/reset-testnet.sh`, which automates steps 1–3: it
    rebuilds and redeploys the contract, builds the CLI, and creates a new
-   test agreement, printing the new contract and agreement IDs.
+   test agreement, printing the new contract and agreement IDs (step 4 is
+   still manual).
 
 ```bash
 ./scripts/reset-testnet.sh

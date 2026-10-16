@@ -1,0 +1,145 @@
+name: Testnet Health
+
+# Daily probe of the live testnet deployment documented in DEPLOYMENT.md
+# (#491). If the contract or the Verified Test Agreement has disappeared — the
+# signature of a testnet reset — a tracking issue is opened (or updated), so
+# contributors don't discover it by hitting "agreement not found" themselves.
+# When the probe passes again, the tracking issue is closed automatically.
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: testnet-health
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with DEPLOYMENT.md "Live Contract" / "Verified Test Agreement".
+  LIVE_CONTRACT_ID: CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q
+  LIVE_AGREEMENT_ID: '0101010101010101010101010101010101010101010101010101010101010101'
+  ISSUE_TITLE: 'Testnet reset detected: live contract / test agreement no longer resolve'
+  ISSUE_LABEL: testnet-reset
+
+jobs:
+  probe:
+    name: Probe live testnet deployment
+    runs-on: ubuntu-latest
+    # Forks have no reason to file issues about the upstream deployment.
+    if: github.repository == 'Trellis-Ecosystem/trellis'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install stellar CLI
+        run: |
+          curl -sL -o stellar-cli.tar.gz https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf stellar-cli.tar.gz
+          sudo mv stellar /usr/local/bin/stellar
+          stellar --version
+
+      - name: Build trellis CLI
+        run: cargo build --release --manifest-path=cli/trellis_cli/Cargo.toml
+
+      # `status` is a read-only simulation, but the stellar CLI still needs an
+      # existing source account to build it. A throwaway Friendbot-funded key
+      # is enough; it never signs anything that is submitted.
+      - name: Create throwaway probe identity
+        run: stellar keys generate trellis-probe --network testnet --fund
+
+      - name: Probe live agreement
+        id: probe
+        env:
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015'
+          TRELLIS_CONTRACT_ID: ${{ env.LIVE_CONTRACT_ID }}
+          TRELLIS_SOURCE_KEY: trellis-probe
+          TRELLIS_BIN: target/release/trellis
+        run: |
+          set +e
+          scripts/check-testnet-health.sh "$LIVE_AGREEMENT_ID"
+          code=$?
+          case "$code" in
+            0)  echo "result=healthy" >> "$GITHUB_OUTPUT" ;;
+            10) echo "result=reset" >> "$GITHUB_OUTPUT" ;;
+            *)  echo "result=inconclusive" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit 0
+
+      - name: Write job summary
+        if: always()
+        env:
+          RESULT: ${{ steps.probe.outputs.result }}
+        run: |
+          {
+            echo "### Testnet health: \`${RESULT:-not run}\`"
+            echo
+            echo "Contract \`$LIVE_CONTRACT_ID\`, agreement \`$LIVE_AGREEMENT_ID\`"
+            echo
+            echo '```'
+            tail -n 40 probe.log 2>/dev/null || echo "(no probe output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update tracking issue
+        if: steps.probe.outputs.result == 'reset'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create "$ISSUE_LABEL" --color D93F0B \
+            --description "Stellar testnet was reset; live deployment needs redeploying" 2>/dev/null || true
+
+          existing=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number')
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "Still failing as of $(date -u +%Y-%m-%dT%H:%MZ): $RUN_URL"
+          else
+            body=$(cat <<EOF
+          The scheduled [Testnet Health]($RUN_URL) probe could not find the live deployment:
+
+          - Contract: \`$LIVE_CONTRACT_ID\`
+          - Agreement: \`$LIVE_AGREEMENT_ID\`
+
+          This usually means Stellar testnet was reset. Follow
+          [DEPLOYMENT.md → Testnet Reset → Recovering]($REPO_URL/blob/master/DEPLOYMENT.md#recovering)
+          (or run \`scripts/reset-testnet.sh\`), then update the contract and agreement IDs in
+          DEPLOYMENT.md and \`.github/workflows/testnet-health.yml\`.
+
+          This issue closes automatically once the probe passes again.
+          EOF
+            )
+            gh issue create --title "$ISSUE_TITLE" --label "$ISSUE_LABEL" --body "$body"
+          fi
+
+      - name: Close tracking issue on recovery
+        if: steps.probe.outputs.result == 'healthy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          for n in $(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Testnet probe is passing again: $RUN_URL"
+          done
+
+      # A reset is reported via the issue above; anything else is an
+      # infrastructure hiccup that shouldn't file an issue but should still
+      # show up as a red run.
+      - name: Fail on reset or inconclusive probe
+        if: steps.probe.outputs.result != 'healthy'
+        run: |
+          echo "Probe result: ${{ steps.probe.outputs.result }}"
+          exit 1
