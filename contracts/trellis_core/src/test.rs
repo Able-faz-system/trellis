@@ -877,6 +877,113 @@ fn test_batch_lock_funds() {
     );
 }
 
+/// #611: `batch_lock_funds` moves the whole batch with a single summed token
+/// transfer, while still emitting one `trls_lckd` event per milestone and
+/// leaving balances identical to funding each milestone individually. It must
+/// also be measurably cheaper than the equivalent sequence of `lock_funds`
+/// calls.
+#[test]
+fn test_batch_lock_funds_single_summed_transfer() {
+    const COUNT: u32 = 20;
+    const AMOUNT: i128 = 50;
+
+    let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+    let token_client = token::TokenClient::new(&env, &token_address);
+
+    let mut milestones: Vec<Milestone> = Vec::new(&env);
+    let mut milestone_ids: Vec<u32> = Vec::new(&env);
+    for i in 0..COUNT {
+        milestones.push_back(Milestone {
+            amount: AMOUNT,
+            status: EscrowStatus::Pending,
+            proof_uri: None,
+        });
+        milestone_ids.push_back(i);
+    }
+
+    // Baseline: fund an identical agreement one milestone at a time.
+    let sequential_id = agreement_id(&env, 71);
+    client.init(
+        &sequential_id,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones,
+        &dispute_resolver,
+    );
+    let mut sequential_cpu: u64 = 0;
+    for i in 0..COUNT {
+        env.cost_estimate().budget().reset_default();
+        client.lock_funds(&sequential_id, &i);
+        sequential_cpu += env.cost_estimate().budget().cpu_instruction_cost();
+    }
+
+    let payer_before = token_client.balance(&payer);
+    let contract_before = token_client.balance(&client.address);
+
+    let batch_id = agreement_id(&env, 72);
+    client.init(
+        &batch_id,
+        &payer,
+        &payee,
+        &token_address,
+        &milestones,
+        &dispute_resolver,
+    );
+    env.cost_estimate().budget().reset_default();
+    let funded = client.batch_lock_funds(&batch_id, &milestone_ids);
+    let batch_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // Events must be inspected straight after the call (see
+    // `assert_trellis_topics`).
+    let all_events = env.events().all();
+    let transfer = Symbol::new(&env, "transfer");
+    let mut transfers = 0u32;
+    let mut locked = 0u32;
+    for i in 0..all_events.len() {
+        let (contract_id, topics, data) = all_events.get_unchecked(i);
+        let topic0 = Symbol::try_from_val(&env, &topics.get_unchecked(0))
+            .expect("event topic 0 must decode as a Symbol");
+        if contract_id == token_address && topic0 == transfer {
+            let moved = i128::try_from_val(&env, &data).expect("transfer data is the amount");
+            assert_eq!(moved, AMOUNT * COUNT as i128, "the transfer must carry the summed total");
+            transfers += 1;
+        } else if contract_id == client.address && topic0 == symbol_short!("trls_lckd") {
+            let (milestone_id, amount): (u32, i128) = <(u32, i128)>::try_from_val(&env, &data)
+                .expect("trls_lckd data must be (milestone_id, amount)");
+            assert_eq!(milestone_id, locked, "trls_lckd events must follow batch order");
+            assert_eq!(amount, AMOUNT);
+            locked += 1;
+        }
+    }
+    assert_eq!(transfers, 1, "a batch must make exactly one token transfer");
+    assert_eq!(locked, COUNT, "one trls_lckd event per funded milestone");
+
+    assert_eq!(funded, COUNT);
+    assert_eq!(
+        token_client.balance(&payer),
+        payer_before - AMOUNT * COUNT as i128,
+        "payer must be debited the batch total"
+    );
+    assert_eq!(
+        token_client.balance(&client.address),
+        contract_before + AMOUNT * COUNT as i128,
+        "contract must be credited the batch total"
+    );
+    let agreement = client.get_agreement(&batch_id);
+    for i in 0..COUNT {
+        assert_eq!(
+            agreement.milestones.get(i).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    assert!(
+        batch_cpu < sequential_cpu,
+        "batch ({batch_cpu}) must cost less CPU than {COUNT} sequential lock_funds ({sequential_cpu})"
+    );
+}
+
 /// batch_lock_funds short-circuits on the first already-funded milestone.
 #[test]
 fn test_batch_lock_funds_partial_failure() {
