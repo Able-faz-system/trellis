@@ -12,7 +12,7 @@ mod utils;
 #[path = "../sdk_compat.rs"]
 mod sdk_compat;
 
-use clap::{CommandFactory, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use commands::{Commands, OutputFormat, OutputOpts};
 use config::{Network, Role};
 use std::process;
@@ -23,9 +23,10 @@ use std::process;
 
 /// Trellis Protocol CLI — milestone-based escrow on Stellar Soroban.
 ///
-/// Configuration can be loaded from a `.env` file in the working directory or
-/// set as environment variables.  CLI flags take highest priority, then env
-/// vars, then the `.env` file.
+/// Configuration can be loaded from a `.env` file in the working directory (or
+/// an explicit file via `--env-file` / `TRELLIS_ENV_FILE`) or set as
+/// environment variables.  CLI flags take highest priority, then env vars,
+/// then the env file.
 ///
 /// Required variables:
 ///   TRELLIS_CONTRACT_ID        — Bech32 contract address (`C…`)
@@ -124,6 +125,13 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
+    /// Trace RPC attempts to stderr for debugging retry behavior. `-v` shows
+    /// each attempt's exit code, full error output and why retrying stopped;
+    /// `-vv` also prints the full (secret-redacted) command and per-attempt
+    /// timing. Ignored under `--quiet`.
+    #[arg(short = 'v', long, global = true, action = ArgAction::Count)]
+    verbose: u8,
+
     /// Allow a cleartext `http://` RPC endpoint for a non-localhost host.
     ///
     /// By default the CLI refuses any RPC URL that is not `https://` unless
@@ -132,6 +140,40 @@ struct Cli {
     /// endpoint. Pass this flag for development against a self-hosted devnet.
     #[arg(long, global = true)]
     unsafe_rpc: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Env file loading (#66, #487)
+// ---------------------------------------------------------------------------
+
+/// Load configuration variables from an env file.
+///
+/// When `explicit` is set (from `--env-file` or `TRELLIS_ENV_FILE`) only that
+/// file is loaded, and a missing/unreadable file is an error — silently
+/// falling back to CWD discovery would run the command against the wrong
+/// identity or network. Otherwise `.env` is discovered in the current
+/// directory (and its ancestors) exactly as before, and a missing file is
+/// ignored so users who rely purely on exported env vars are unaffected.
+///
+/// Variables already present in the process environment are never
+/// overridden. Returns the path that was loaded, if any.
+fn load_env_file(explicit: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    match explicit {
+        Some(path) => dotenvy::from_path(path)
+            .map(|()| Some(path.to_path_buf()))
+            .map_err(|e| format!("Error: failed to load env file `{}`: {e}", path.display())),
+        None => Ok(dotenvy::dotenv().ok()),
+    }
+}
+
+/// Resolve the explicit env file path: `--env-file` wins over
+/// `TRELLIS_ENV_FILE`; an empty env var counts as unset.
+fn explicit_env_file(flag: Option<PathBuf>) -> Option<PathBuf> {
+    flag.or_else(|| {
+        std::env::var_os("TRELLIS_ENV_FILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -248,14 +290,16 @@ fn output_opts(cli: &Cli) -> OutputOpts {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    // ── #66: Load .env file before reading any env vars ───────────────────
-    // dotenvy::dotenv() looks for a `.env` file in the current directory (and
-    // walks up to the workspace root).  `.ok()` silently ignores a missing
-    // file — users who rely purely on exported env vars are unaffected.
-    // Priority: CLI args > env vars > .env file values.
-    dotenvy::dotenv().ok();
-
     let cli = Cli::parse();
+
+    // ── #66/#487: Load the env file before reading any config env vars ────
+    // No clap arg reads from the environment, so parsing first is safe and
+    // lets `--env-file` pick the file. Without it, `.env` is discovered from
+    // the CWD as before. Priority: CLI args > env vars > env file values.
+    if let Err(msg) = load_env_file(explicit_env_file(cli.env_file.clone()).as_deref()) {
+        eprintln!("{msg}");
+        process::exit(1);
+    }
 
     // ── #75: Shell completions never touch the network or the stellar
     // binary, so handle them before environment validation / dispatch. ────
@@ -378,6 +422,7 @@ fn main() {
 mod tests {
     use super::*;
     use crate::strkey::{decode, encode, StrkeyError, StrkeyKind};
+    use std::fs;
 
     #[test]
     fn long_version_reports_manifest_sdk_range() {
@@ -457,5 +502,77 @@ mod tests {
             Err(StrkeyError::UnknownVersion(0xFF)) => {}
             other => panic!("expected UnknownVersion(0xFF), got {other:?}"),
         }
+    }
+
+    /// Write `contents` to a uniquely-named file in a fresh temp directory
+    /// (outside the crate, so CWD-relative discovery could never find it).
+    fn temp_env_file(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trellis-env-file-{name}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.env");
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn loads_variables_from_explicit_path_outside_cwd() {
+        let path = temp_env_file("explicit", "TRELLIS_TEST_ENV_FILE_A=from-file\n");
+        std::env::remove_var("TRELLIS_TEST_ENV_FILE_A");
+
+        let loaded = load_env_file(Some(&path)).expect("explicit file loads");
+
+        assert_eq!(loaded.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            std::env::var("TRELLIS_TEST_ENV_FILE_A").as_deref(),
+            Ok("from-file")
+        );
+        std::env::remove_var("TRELLIS_TEST_ENV_FILE_A");
+    }
+
+    #[test]
+    fn explicit_path_does_not_override_exported_vars() {
+        let path = temp_env_file("precedence", "TRELLIS_TEST_ENV_FILE_B=from-file\n");
+        std::env::set_var("TRELLIS_TEST_ENV_FILE_B", "exported");
+
+        load_env_file(Some(&path)).expect("explicit file loads");
+
+        assert_eq!(
+            std::env::var("TRELLIS_TEST_ENV_FILE_B").as_deref(),
+            Ok("exported")
+        );
+        std::env::remove_var("TRELLIS_TEST_ENV_FILE_B");
+    }
+
+    #[test]
+    fn missing_explicit_path_is_an_error() {
+        let path = std::env::temp_dir().join("trellis-env-file-does-not-exist.env");
+        let err = load_env_file(Some(&path)).unwrap_err();
+        assert!(err.contains("failed to load env file"), "{err}");
+        assert!(err.contains("trellis-env-file-does-not-exist.env"), "{err}");
+    }
+
+    #[test]
+    fn no_explicit_path_falls_back_to_discovery_without_error() {
+        // Whether or not a `.env` exists up the tree, discovery never fails.
+        assert!(load_env_file(None).is_ok());
+    }
+
+    #[test]
+    fn env_file_flag_takes_priority_over_env_var() {
+        std::env::set_var("TRELLIS_ENV_FILE", "/from/env/var.env");
+        assert_eq!(
+            explicit_env_file(Some(PathBuf::from("/from/flag.env"))),
+            Some(PathBuf::from("/from/flag.env"))
+        );
+        assert_eq!(
+            explicit_env_file(None),
+            Some(PathBuf::from("/from/env/var.env"))
+        );
+        std::env::set_var("TRELLIS_ENV_FILE", "");
+        assert_eq!(explicit_env_file(None), None);
+        std::env::remove_var("TRELLIS_ENV_FILE");
     }
 }

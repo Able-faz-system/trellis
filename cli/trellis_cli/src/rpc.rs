@@ -50,6 +50,9 @@ pub struct InvokeOutput {
     pub stderr: String,
     /// Whether the process exited successfully.
     pub success: bool,
+    /// Raw process exit code. `None` if the process could not be spawned or
+    /// was terminated by a signal.
+    pub exit_code: Option<i32>,
     /// The exact command string that was executed — printed on failure so
     /// the caller can reproduce/debug locally.
     pub command_debug: String,
@@ -1045,13 +1048,20 @@ impl RpcClient {
     /// * `args`    – a flat list of `--flag value` pairs **after** the `--`
     ///   separator, e.g. `["--agreement_id", "0x…", "--payer", "G…"]`
     /// * `quiet`   – suppress the retry progress messages normally printed to stderr
-    pub fn invoke(config: &Config, fn_name: &str, args: &[String], quiet: bool) -> InvokeOutput {
+    /// * `verbose` – RPC tracing level (`-v` / `-vv`); see [`attempt_trace`]
+    pub fn invoke(
+        config: &Config,
+        fn_name: &str,
+        args: &[String],
+        quiet: bool,
+        verbose: u8,
+    ) -> InvokeOutput {
         // TODO(native-rpc): replace this shell-out with direct Soroban
         // JSON-RPC calls (typed arg parsing, key loading, envelope signing,
         // submit + poll). See the `RpcClient` type docs for the full plan.
         // Until then we delegate to the `stellar` CLI, which already handles
         // argument encoding, transaction assembly, signing and submission.
-        Self::invoke_with_retry(config, fn_name, args, quiet)
+        Self::invoke_with_retry(config, fn_name, args, quiet, verbose)
     }
 
     /// Build the exact `stellar contract invoke …` argument list and its
@@ -1158,6 +1168,7 @@ impl RpcClient {
                                     stdout: String::new(),
                                     stderr: format!("sendTransaction failed: {}", err_msg),
                                     success: false,
+                                    exit_code: None,
                                     command_debug: format!("sendTransaction({})", rpc_url),
                                 };
                             }
@@ -1174,6 +1185,7 @@ impl RpcClient {
                                     stdout: String::new(),
                                     stderr: format!("Transaction failed: {}", error_result),
                                     success: false,
+                                    exit_code: None,
                                     command_debug: format!("sendTransaction({})", rpc_url),
                                 };
                             }
@@ -1188,6 +1200,7 @@ impl RpcClient {
                                 stdout: String::new(),
                                 stderr: format!("Failed to parse sendTransaction response: {}", e),
                                 success: false,
+                                exit_code: None,
                                 command_debug: format!("sendTransaction({})", rpc_url),
                             };
                         }
@@ -1199,6 +1212,7 @@ impl RpcClient {
                             stdout: String::new(),
                             stderr: format!("sendTransaction network error: {}", e),
                             success: false,
+                            exit_code: None,
                             command_debug: format!("sendTransaction({})", rpc_url),
                         };
                     }
@@ -1247,6 +1261,7 @@ impl RpcClient {
                                         stdout: serde_json::to_string_pretty(&result).unwrap_or_default(),
                                         stderr: String::new(),
                                         success: true,
+                                        exit_code: None,
                                         command_debug: format!("getTransaction({})", send_res),
                                     };
                                 }
@@ -1256,6 +1271,7 @@ impl RpcClient {
                                         stdout: String::new(),
                                         stderr: format!("Transaction failed on-chain: status={}, errorResult={}", status, err_res),
                                         success: false,
+                                        exit_code: None,
                                         command_debug: format!("getTransaction({})", send_res),
                                     };
                                 }
@@ -1275,6 +1291,7 @@ impl RpcClient {
                     stdout: String::new(),
                     stderr: format!("Transaction polling timed out after {} attempts (hash: {})", max_polls, send_res),
                     success: false,
+                    exit_code: None,
                     command_debug: format!("getTransaction({})", send_res),
                 };
             }
@@ -1390,11 +1407,16 @@ impl RpcClient {
     /// concurrent processes do not thunder-herd the RPC endpoint together.
     ///
     /// Set `STELLAR_RPC_RETRIES=0` to disable retries entirely.
+    ///
+    /// With `verbose >= 1` every attempt's outcome and the reason retrying
+    /// stopped are traced to stderr; `verbose >= 2` also prints the full
+    /// (secret-redacted) command before each attempt. See [`attempt_trace`].
     fn invoke_with_retry(
         config: &Config,
         fn_name: &str,
         args: &[String],
         quiet: bool,
+        verbose: u8,
     ) -> InvokeOutput {
         let max_retries: u32 = std::env::var("STELLAR_RPC_RETRIES")
             .ok()
@@ -1404,9 +1426,24 @@ impl RpcClient {
         // Exponential backoff: 1 s → 2 s → 4 s → 8 s (capped at index 3).
         const BACKOFF_MS: [u64; 4] = [1_000, 2_000, 4_000, 8_000];
 
+        let total_attempts = max_retries.saturating_add(1);
         let mut attempt = 0u32;
         loop {
+            if verbose >= 2 {
+                // `preview` reuses `build_cmd_args`, so a raw secret seed is
+                // already redacted here (#240).
+                eprintln!(
+                    "[trellis] attempt {}/{total_attempts}: {}",
+                    attempt + 1,
+                    Self::preview(config, fn_name, args)
+                );
+            }
+
+            let started = std::time::Instant::now();
             let out = Self::invoke_once(config, fn_name, args);
+            for line in attempt_trace(verbose, attempt + 1, total_attempts, &out, started.elapsed()) {
+                eprintln!("{line}");
+            }
 
             if out.success {
                 return out;
@@ -1414,15 +1451,18 @@ impl RpcClient {
 
             // Spawn failure means the stellar CLI is not installed — no point retrying.
             if out.stderr.starts_with("Failed to spawn") {
+                trace_stop(verbose, "the stellar CLI could not be spawned");
                 return out;
             }
 
             if attempt >= max_retries {
+                trace_stop(verbose, "retry budget (STELLAR_RPC_RETRIES) exhausted");
                 return out;
             }
 
             // Only retry errors that look like transient network / RPC issues.
             if !is_transient_error(&out.stderr) {
+                trace_stop(verbose, "error is not transient");
                 return out;
             }
 
@@ -1489,6 +1529,7 @@ impl RpcClient {
                          Is the Stellar CLI installed?  https://developers.stellar.org/docs/tools/cli/install-cli"
                     ),
                     success: false,
+                    exit_code: None,
                     command_debug,
                 };
             }
@@ -1502,12 +1543,14 @@ impl RpcClient {
                     stdout: decode_process_output("stdout", out.stdout),
                     stderr: decode_process_output("stderr", out.stderr),
                     success: out.status.success(),
+                    exit_code: out.status.code(),
                     command_debug,
                 },
                 Err(e) => InvokeOutput {
                     stdout: String::new(),
                     stderr: format!("Failed to wait for `stellar` CLI: {e}"),
                     success: false,
+                    exit_code: None,
                     command_debug,
                 },
             };
@@ -1531,6 +1574,7 @@ impl RpcClient {
                     stdout: decode_process_output("stdout", out.stdout),
                     stderr: decode_process_output("stderr", out.stderr),
                     success: out.status.success(),
+                    exit_code: out.status.code(),
                     command_debug,
                 }
             }
@@ -1540,6 +1584,7 @@ impl RpcClient {
                     stdout: String::new(),
                     stderr: format!("Failed to wait for `stellar` CLI: {e}"),
                     success: false,
+                    exit_code: None,
                     command_debug,
                 }
             }
@@ -1560,6 +1605,7 @@ impl RpcClient {
                          You can raise STELLAR_INVOKE_TIMEOUT_SECS to allow more time."
                     ),
                     success: false,
+                    exit_code: None,
                     command_debug,
                 }
             }
@@ -1569,6 +1615,7 @@ impl RpcClient {
                     stdout: String::new(),
                     stderr: "internal error: worker thread exited unexpectedly".to_string(),
                     success: false,
+                    exit_code: None,
                     command_debug,
                 }
             }
@@ -1721,6 +1768,56 @@ fn parse_json_rpc_response<T: serde::de::DeserializeOwned>(
     envelope
         .result
         .ok_or_else(|| format!("{method}: JSON-RPC response has neither result nor error"))
+}
+
+/// Build the `--verbose` trace lines for one finished attempt.
+///
+/// * `verbose == 0` – nothing (default output is unchanged).
+/// * `verbose >= 1` – the attempt's outcome and raw process exit code, plus
+///   the full stderr of a failed attempt (the default retry message only
+///   shows its first line).
+/// * `verbose >= 2` – additionally the attempt's wall-clock duration.
+///
+/// Kept pure (no printing) so the exact output per level is unit-testable.
+fn attempt_trace(
+    verbose: u8,
+    attempt: u32,
+    total_attempts: u32,
+    out: &InvokeOutput,
+    elapsed: std::time::Duration,
+) -> Vec<String> {
+    if verbose == 0 {
+        return Vec::new();
+    }
+
+    let outcome = if out.success { "succeeded" } else { "failed" };
+    let exit = match out.exit_code {
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".to_string(),
+    };
+    let mut line = format!("[trellis] attempt {attempt}/{total_attempts} {outcome} ({exit}");
+    if verbose >= 2 {
+        line.push_str(&format!(", {}ms", elapsed.as_millis()));
+    }
+    line.push(')');
+
+    let mut lines = vec![line];
+    if !out.success {
+        lines.extend(
+            out.stderr
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| format!("[trellis]   stderr: {l}")),
+        );
+    }
+    lines
+}
+
+/// Under `--verbose`, explain why the retry loop gave up on a failed attempt.
+fn trace_stop(verbose: u8, reason: &str) {
+    if verbose >= 1 {
+        eprintln!("[trellis] not retrying: {reason}");
+    }
 }
 
 /// Decode a subprocess output stream, without silently discarding bytes.
@@ -2710,5 +2807,58 @@ mod tests {
         }
 
         handle.join().expect("mock server thread");
+    }
+
+    // --- #488: --verbose attempt tracing ---
+
+    fn finished(success: bool, exit_code: Option<i32>, stderr: &str) -> InvokeOutput {
+        InvokeOutput {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            success,
+            exit_code,
+            command_debug: "stellar contract invoke".to_string(),
+        }
+    }
+
+    const ELAPSED: std::time::Duration = std::time::Duration::from_millis(1234);
+
+    #[test]
+    fn attempt_trace_is_silent_without_verbose() {
+        let out = finished(false, Some(1), "error: timeout");
+        assert!(attempt_trace(0, 1, 4, &out, ELAPSED).is_empty());
+    }
+
+    #[test]
+    fn attempt_trace_v_shows_exit_code_and_full_stderr_without_timing() {
+        let out = finished(false, Some(1), "error: request timed out\ncaused by: 503\n");
+        let lines = attempt_trace(1, 2, 4, &out, ELAPSED);
+        assert_eq!(lines[0], "[trellis] attempt 2/4 failed (exit code 1)");
+        assert_eq!(lines[1], "[trellis]   stderr: error: request timed out");
+        assert_eq!(lines[2], "[trellis]   stderr: caused by: 503");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn attempt_trace_vv_adds_per_attempt_timing() {
+        let out = finished(true, Some(0), "");
+        let lines = attempt_trace(2, 1, 4, &out, ELAPSED);
+        assert_eq!(lines, vec!["[trellis] attempt 1/4 succeeded (exit code 0, 1234ms)"]);
+    }
+
+    #[test]
+    fn attempt_trace_handles_missing_exit_code() {
+        let out = finished(false, None, "Failed to spawn `stellar` CLI: not found");
+        let lines = attempt_trace(1, 1, 1, &out, ELAPSED);
+        assert_eq!(lines[0], "[trellis] attempt 1/1 failed (no exit code)");
+    }
+
+    #[test]
+    fn verbose_command_trace_never_prints_a_secret_seed() {
+        // The -vv trace prints `RpcClient::preview`; pin that it stays redacted.
+        let seed = a_seed();
+        let line = RpcClient::preview(&cfg_with_source(&seed), "lock_funds", &[]);
+        assert!(!line.contains(&seed), "verbose trace leaked the seed: {line}");
+        assert!(line.contains("<redacted>"));
     }
 }

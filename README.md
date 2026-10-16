@@ -777,6 +777,39 @@ an error naming both values, so a mismatched `--rpc-url` (e.g. mainnet RPC with 
 testnet passphrase) is caught immediately instead of surfacing as a confusing
 downstream failure. This check is skipped under `--dry-run`.
 
+#### Loading Configuration From a Specific File
+
+By default the CLI loads a `.env` file from the current directory (or the
+nearest ancestor). To switch between identities/environments without `cd`-ing
+or re-exporting variables, point it at an explicit file instead:
+
+```bash
+trellis status --agreement-id <hex-id> --env-file ~/trellis/payer.env
+
+# or, for every command in the shell session
+export TRELLIS_ENV_FILE=~/trellis/payer.env
+```
+
+`--env-file` overrides `TRELLIS_ENV_FILE`. When either is set, CWD discovery
+is skipped and a missing or unreadable file is an error. Exported environment
+variables and CLI flags still take priority over values in the file.
+
+#### Verbose RPC Tracing
+
+Use `-v` / `--verbose` (repeatable) to debug RPC retry behavior. Traces go to
+stderr, so `--json` output on stdout stays parseable:
+
+```bash
+# Each attempt's outcome, raw exit code, full error output, and why retrying stopped
+trellis status --agreement-id <hex-id> -v
+
+# Also the full `stellar contract invoke` command and per-attempt timing
+trellis status --agreement-id <hex-id> -vv
+```
+
+Raw `S…` secret seeds are always shown as `STELLAR_SECRET_KEY=<redacted>`.
+`--quiet` overrides `--verbose`.
+
 #### Shell Completions
 
 ```bash
