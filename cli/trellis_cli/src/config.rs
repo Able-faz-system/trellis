@@ -8,6 +8,48 @@ pub enum Network {
     Custom,
 }
 
+/// Escrow role whose identity should sign a command, selected with `--as`.
+///
+/// Each role reads its key from its own env vars (typically set once in
+/// `.env`), so one config can hold the payer, payee and resolver identities
+/// together instead of re-exporting `TRELLIS_SOURCE_KEY` before every command
+/// (#483).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum Role {
+    Payer,
+    Payee,
+    Resolver,
+}
+
+impl Role {
+    /// Env var holding this role's key (secret seed or `stellar` identity).
+    pub fn key_var(self) -> &'static str {
+        match self {
+            Role::Payer => "TRELLIS_PAYER_KEY",
+            Role::Payee => "TRELLIS_PAYEE_KEY",
+            Role::Resolver => "TRELLIS_RESOLVER_KEY",
+        }
+    }
+
+    /// Env var holding a path to a file containing this role's key.
+    pub fn key_file_var(self) -> &'static str {
+        match self {
+            Role::Payer => "TRELLIS_PAYER_KEY_FILE",
+            Role::Payee => "TRELLIS_PAYEE_KEY_FILE",
+            Role::Resolver => "TRELLIS_RESOLVER_KEY_FILE",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Role::Payer => "payer",
+            Role::Payee => "payee",
+            Role::Resolver => "resolver",
+        }
+    }
+}
+
 /// Known RPC URL and network passphrase for a non-custom `Network`.
 pub struct NetworkPreset {
     pub rpc_url: &'static str,
@@ -60,6 +102,11 @@ pub struct Config {
     /// `stellar` CLI (e.g. `alice`).
     /// Env: `TRELLIS_SOURCE_KEY`
     pub source_key: String,
+
+    /// Where `source_key` was read from: `--source-key-file`,
+    /// `TRELLIS_SOURCE_KEY_FILE`, `TRELLIS_SOURCE_KEY`, or `unset`. Only
+    /// used for diagnostics (`trellis config`, #485).
+    pub source_key_origin: &'static str,
 }
 
 /// Number of characters in a Stellar strkey address (`C…` / `G…` / `S…`),
@@ -144,7 +191,7 @@ impl Config {
             _ => Network::Testnet,
         };
 
-        Self::resolve(network, None, None)
+        Self::resolve(network, None, None, None, None)
     }
 
     /// Resolve configuration from a `--network` preset plus optional CLI
@@ -160,11 +207,19 @@ impl Config {
     /// environment variable that leaks into `/proc/<pid>/environ` or shell
     /// history (see #240):
     ///   `--source-key-file` > `TRELLIS_SOURCE_KEY_FILE` > `TRELLIS_SOURCE_KEY`.
+    ///
+    /// With `--as <role>` the role's own variables are used instead
+    /// (`TRELLIS_<ROLE>_KEY_FILE` > `TRELLIS_<ROLE>_KEY`), and `Err` is
+    /// returned if neither is set. There is deliberately no fallback to
+    /// `TRELLIS_SOURCE_KEY`: silently signing as a different identity than
+    /// the one asked for is worse than failing. `--as` and
+    /// `--source-key-file` conflict at the clap level.
     pub fn resolve(
         network: Network,
         cli_rpc_url: Option<String>,
         cli_network_passphrase: Option<String>,
         cli_source_key_file: Option<String>,
+        role: Option<Role>,
     ) -> Result<Self, String> {
         let preset = network.preset();
 
@@ -186,14 +241,34 @@ impl Config {
         let contract_id = std::env::var("TRELLIS_CONTRACT_ID")
             .unwrap_or_else(|_| "UNSET_CONTRACT_ID".to_string());
 
-        let source_key =
-            std::env::var("TRELLIS_SOURCE_KEY").unwrap_or_else(|_| "UNSET_SOURCE_KEY".to_string());
+        let (source_key, source_key_origin) = match role {
+            None => resolve_source_key_value(
+                cli_source_key_file,
+                KeyVar::new("TRELLIS_SOURCE_KEY_FILE"),
+                KeyVar::new("TRELLIS_SOURCE_KEY"),
+            )?
+            .unwrap_or_else(|| ("UNSET_SOURCE_KEY".to_string(), "unset")),
+            Some(role) => resolve_source_key_value(
+                None,
+                KeyVar::new(role.key_file_var()),
+                KeyVar::new(role.key_var()),
+            )?
+            .ok_or_else(|| {
+                format!(
+                    "Error: --as {} requires {} (or {}) to be set, e.g. in .env",
+                    role.name(),
+                    role.key_var(),
+                    role.key_file_var()
+                )
+            })?,
+        };
 
         Ok(Config {
             rpc_url,
             network_passphrase,
             contract_id,
             source_key,
+            source_key_origin,
         })
     }
 
@@ -226,6 +301,27 @@ impl Config {
         }
     }
 
+    /// The source key in a form that is safe to print.
+    ///
+    /// A value that looks like a raw secret seed (`S…`, or anything 56+ chars
+    /// long, which also covers a lowercase or otherwise malformed seed) is
+    /// reduced to its first character plus `...***`. Shorter values are
+    /// `stellar keys` identity names such as `alice`, which are not secret
+    /// and are exactly what a user debugging "which identity am I signing
+    /// as?" needs to see, so they are shown in full. Returns `None` when no
+    /// key is configured.
+    pub fn masked_source_key(&self) -> Option<String> {
+        if self.source_key == "UNSET_SOURCE_KEY" {
+            return None;
+        }
+        let key = self.source_key.as_str();
+        if is_secret_seed(&key.to_ascii_uppercase()) || key.chars().count() >= STRKEY_LEN {
+            let first = key.chars().next().unwrap_or('*');
+            return Some(format!("{first}...***"));
+        }
+        Some(key.to_string())
+    }
+
     /// Try to resolve the source key from keystore, then fall back to env var.
     pub fn resolve_source_key(&self) -> Result<String, String> {
         use crate::keystore::Keystore;
@@ -236,19 +332,105 @@ impl Config {
     }
 }
 
+/// An env var name paired with its value, if set.
+struct KeyVar {
+    name: &'static str,
+    value: Option<String>,
+}
+
+impl KeyVar {
+    fn new(name: &'static str) -> Self {
+        KeyVar {
+            name,
+            value: std::env::var(name).ok(),
+        }
+    }
+}
+
+/// Pick the source key from, in priority order, the `--source-key-file` flag,
+/// the key-file env var (`TRELLIS_SOURCE_KEY_FILE` or a role's
+/// `TRELLIS_<ROLE>_KEY_FILE`), or the plaintext key env var.
+///
+/// A configured file always wins over the plaintext variable, even when both
+/// are set. In that case a note goes to stderr, because a stale exported
+/// `TRELLIS_SOURCE_KEY` left behind after switching to a key file is easy to
+/// miss. A file that is configured but unreadable or empty is a hard error
+/// rather than a silent fallback to the env var: signing with a different
+/// identity than the one the user pointed at is worse than failing.
+///
+/// Returns the key together with the name of the flag / env var it came
+/// from, or `Ok(None)` when no source is configured at all, so the caller can
+/// keep the `UNSET_SOURCE_KEY` sentinel that `validate()` reports.
+fn resolve_source_key_value(
+    cli_file: Option<String>,
+    env_file: KeyVar,
+    env_key: KeyVar,
+) -> Result<Option<(String, &'static str)>, String> {
+    let file = cli_file
+        .map(|p| (p, "--source-key-file"))
+        .or_else(|| env_file.value.map(|p| (p, env_file.name)))
+        .filter(|(p, _)| !p.trim().is_empty());
+
+    match file {
+        Some((path, origin)) => {
+            if env_key.value.is_some() {
+                eprintln!(
+                    "Note: both {origin} and {key} are set; using the key file \
+                     and ignoring {key}.",
+                    key = env_key.name
+                );
+            }
+            read_source_key_file(&path, origin).map(|k| Some((k, origin)))
+        }
+        None => Ok(env_key.value.map(|k| (k, env_key.name))),
+    }
+}
+
 /// Read a source key from `path`, trimming surrounding whitespace / newlines.
 ///
 /// Keeping the secret in a file (ideally mode `0600`) instead of an argv
-/// entry or exported env var is the mitigation for #240: file contents are
-/// never visible in `ps` output.
-fn read_source_key_file(path: &str) -> Result<String, String> {
+/// entry or exported env var is the mitigation for #240 / #486: file contents
+/// are never visible in `ps` output or `/proc/<pid>/environ`. `origin` names
+/// the flag or env var the path came from, for error messages.
+fn read_source_key_file(path: &str, origin: &str) -> Result<String, String> {
+    warn_if_key_file_too_open(path);
+
     let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("Error: cannot read --source-key-file {path:?}: {e}"))?;
+        .map_err(|e| format!("Error: cannot read {origin} {path:?}: {e}"))?;
     let key = raw.trim().to_string();
     if key.is_empty() {
-        return Err(format!("Error: --source-key-file {path:?} is empty"));
+        return Err(format!("Error: {origin} {path:?} is empty"));
     }
     Ok(key)
+}
+
+/// Print a warning when the key file is readable or writable by the group or
+/// by other users. The key is still used: refusing outright (as `ssh` does)
+/// would break shared CI runners whose secret mounts are `0644`, so this is a
+/// warning, not an error.
+#[cfg(unix)]
+fn warn_if_key_file_too_open(path: &str) {
+    if let Some(mode) = key_file_mode(path) {
+        if mode & 0o077 != 0 {
+            eprintln!(
+                "Warning: source key file {path:?} has permissions {:o}, so other users \
+                 may be able to read it. Restrict it with: chmod 600 {path:?}",
+                mode & 0o777
+            );
+        }
+    }
+}
+
+/// Windows ACLs don't map onto Unix mode bits, so no check is made there.
+#[cfg(not(unix))]
+fn warn_if_key_file_too_open(_path: &str) {}
+
+/// Unix permission bits of `path`, or `None` if it can't be stat'ed (the
+/// subsequent read reports that error properly).
+#[cfg(unix)]
+fn key_file_mode(path: &str) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).ok().map(|m| m.permissions().mode())
 }
 
 /// True when `s` looks like a Stellar strkey secret seed (`S…`, 56 base32
@@ -276,6 +458,7 @@ mod tests {
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             contract_id: contract_id.to_string(),
             source_key: source_key.to_string(),
+            source_key_origin: "TRELLIS_SOURCE_KEY",
         }
     }
 
@@ -348,6 +531,217 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         assert_eq!(err.len(), 1);
         assert!(err[0].contains("TRELLIS_CONTRACT_ID"), "got: {:?}", err);
+    }
+
+    // --- source key resolution (#486) ---
+
+    fn file_var(value: Option<String>) -> KeyVar {
+        KeyVar {
+            name: "TRELLIS_SOURCE_KEY_FILE",
+            value,
+        }
+    }
+
+    fn key_var(value: Option<&str>) -> KeyVar {
+        KeyVar {
+            name: "TRELLIS_SOURCE_KEY",
+            value: value.map(str::to_string),
+        }
+    }
+
+    /// Write `contents` to a fresh file under the system temp dir with the
+    /// given Unix mode and return its path.
+    fn temp_key_file(name: &str, contents: &str, #[allow(unused)] mode: u32) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "trellis-key-{}-{name}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn source_key_falls_back_to_env_var_when_no_file() {
+        let key =
+            resolve_source_key_value(None, file_var(None), key_var(Some("alice"))).unwrap();
+        assert_eq!(key, Some(("alice".to_string(), "TRELLIS_SOURCE_KEY")));
+    }
+
+    #[test]
+    fn source_key_none_when_nothing_configured() {
+        let key = resolve_source_key_value(None, file_var(None), key_var(None)).unwrap();
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn source_key_read_from_env_file_and_trimmed() {
+        let path = temp_key_file("env-file", "  bob\n", 0o600);
+        let key =
+            resolve_source_key_value(None, file_var(Some(path.clone())), key_var(None)).unwrap();
+        assert_eq!(key, Some(("bob".to_string(), "TRELLIS_SOURCE_KEY_FILE")));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn source_key_file_takes_precedence_over_plaintext_env_var() {
+        let path = temp_key_file("over-env", "from-file", 0o600);
+        let key = resolve_source_key_value(
+            None,
+            file_var(Some(path.clone())),
+            key_var(Some("from-env")),
+        )
+        .unwrap();
+        assert_eq!(key, Some(("from-file".to_string(), "TRELLIS_SOURCE_KEY_FILE")));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cli_key_file_takes_precedence_over_env_key_file() {
+        let cli = temp_key_file("cli", "from-cli-file", 0o600);
+        let env = temp_key_file("env", "from-env-file", 0o600);
+        let key = resolve_source_key_value(
+            Some(cli.clone()),
+            file_var(Some(env.clone())),
+            key_var(Some("from-env")),
+        )
+        .unwrap();
+        assert_eq!(key, Some(("from-cli-file".to_string(), "--source-key-file")));
+        std::fs::remove_file(cli).ok();
+        std::fs::remove_file(env).ok();
+    }
+
+    #[test]
+    fn missing_key_file_is_error_not_silent_env_fallback() {
+        let err = resolve_source_key_value(
+            Some("/nonexistent/trellis/key".to_string()),
+            file_var(None),
+            key_var(Some("from-env")),
+        )
+        .unwrap_err();
+        assert!(err.contains("--source-key-file"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_key_file_is_error() {
+        let path = temp_key_file("empty", "  \n", 0o600);
+        let err = resolve_source_key_value(None, file_var(Some(path.clone())), key_var(None))
+            .unwrap_err();
+        assert!(err.contains("TRELLIS_SOURCE_KEY_FILE") && err.contains("empty"), "got: {err}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn blank_key_file_path_is_treated_as_unset() {
+        let key = resolve_source_key_value(
+            None,
+            file_var(Some("   ".to_string())),
+            key_var(Some("alice")),
+        )
+        .unwrap();
+        assert_eq!(key, Some(("alice".to_string(), "TRELLIS_SOURCE_KEY")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_key_file_is_still_used() {
+        let path = temp_key_file("open", "carol", 0o644);
+        assert_eq!(key_file_mode(&path).unwrap() & 0o077, 0o044);
+        let key =
+            resolve_source_key_value(None, file_var(Some(path.clone())), key_var(None)).unwrap();
+        assert_eq!(key.map(|(k, _)| k).as_deref(), Some("carol"));
+        std::fs::remove_file(path).ok();
+    }
+
+    // --- --as role profiles (#483) ---
+
+    #[test]
+    fn role_env_var_names_are_distinct_per_role() {
+        let roles = [Role::Payer, Role::Payee, Role::Resolver];
+        let mut names: Vec<&str> = roles
+            .iter()
+            .flat_map(|r| [r.key_var(), r.key_file_var()])
+            .collect();
+        names.push("TRELLIS_SOURCE_KEY");
+        names.push("TRELLIS_SOURCE_KEY_FILE");
+        let mut deduped = names.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(names.len(), deduped.len(), "{names:?}");
+    }
+
+    #[test]
+    fn role_key_file_takes_precedence_over_role_key() {
+        let path = temp_key_file("role", "payer-from-file", 0o600);
+        let key = resolve_source_key_value(
+            None,
+            KeyVar {
+                name: Role::Payer.key_file_var(),
+                value: Some(path.clone()),
+            },
+            KeyVar {
+                name: Role::Payer.key_var(),
+                value: Some("payer-from-env".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(key, Some(("payer-from-file".to_string(), "TRELLIS_PAYER_KEY_FILE")));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn role_key_file_error_names_the_role_variable() {
+        let err = resolve_source_key_value(
+            None,
+            KeyVar {
+                name: Role::Resolver.key_file_var(),
+                value: Some("/nonexistent/trellis/resolver.key".to_string()),
+            },
+            KeyVar {
+                name: Role::Resolver.key_var(),
+                value: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("TRELLIS_RESOLVER_KEY_FILE"), "got: {err}");
+    }
+
+    // --- masked_source_key (#485) ---
+
+    #[test]
+    fn masked_source_key_hides_secret_seed() {
+        let seed = format!("S{}", "B".repeat(STRKEY_LEN - 1));
+        let cfg = config_with(&valid_contract_id(), &seed);
+        let masked = cfg.masked_source_key().unwrap();
+        assert_eq!(masked, "S...***");
+        assert!(!masked.contains(&seed[1..8]));
+    }
+
+    #[test]
+    fn masked_source_key_hides_lowercase_or_overlong_seed() {
+        let lower = format!("s{}", "b".repeat(STRKEY_LEN - 1));
+        let cfg = config_with(&valid_contract_id(), &lower);
+        assert_eq!(cfg.masked_source_key().unwrap(), "s...***");
+
+        let long = "X".repeat(STRKEY_LEN + 4);
+        let cfg = config_with(&valid_contract_id(), &long);
+        assert_eq!(cfg.masked_source_key().unwrap(), "X...***");
+    }
+
+    #[test]
+    fn masked_source_key_shows_identity_name() {
+        let cfg = config_with(&valid_contract_id(), "trellis-payer");
+        assert_eq!(cfg.masked_source_key().as_deref(), Some("trellis-payer"));
+    }
+
+    #[test]
+    fn masked_source_key_none_when_unset() {
+        let cfg = config_with(&valid_contract_id(), "UNSET_SOURCE_KEY");
+        assert_eq!(cfg.masked_source_key(), None);
     }
 
     // --- validate_rpc_url (#237) ---
