@@ -192,8 +192,13 @@ Proptest automatically shrinks failing inputs to minimal reproducible cases:
 # thread 'prop_balance_conservation_happy_path' panicked at ...
 # minimal failing input: amounts = [1, 2]
 
-# Run with specific seed to reproduce
-PROPTEST_SEED=12345 cargo test prop_balance_conservation_happy_path
+# Re-run with a different RNG seed (decimal u64). The suites use a fixed
+# seed (0x5454_5454) by default so runs and snapshots are reproducible;
+# PROPTEST_RNG_SEED overrides it. (proptest does not read `PROPTEST_SEED`.)
+PROPTEST_RNG_SEED=12345 cargo test prop_balance_conservation_happy_path
+
+# Raise the number of cases per property (default 256)
+PROPTEST_CASES=1000 cargo test test_properties
 ```
 
 ### Gas Regression Failures
