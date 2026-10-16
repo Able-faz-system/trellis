@@ -64,6 +64,8 @@ trellis/
 ├── contracts/trellis_core/  # Soroban smart contract crate
 ├── cli/trellis_cli/         # Rust CLI binary for contract workflows
 ├── frontend/                # React/Vite frontend scaffold
+├── indexer/                 # Optional event indexer + SSE relay (Node, SQLite)
+├── tests/cli_integration/   # CLI + contract tests against a local Stellar node
 ├── Cargo.toml               # Workspace manifest
 ├── DEPLOYMENT.md            # Testnet deployment and verification guide
 └── README.md                # Product overview and quickstart
@@ -199,6 +201,49 @@ After running tests from inside `contracts/trellis_core`, return to the workspac
 ```bash
 cd ../..
 ```
+
+### CLI integration tests against a local node
+
+The Rust unit tests run the contract in the Soroban sandbox and never call
+the real `stellar` CLI. The **`cli-integration`** job in
+[`contract-ci.yml`](.github/workflows/contract-ci.yml) covers that gap. It
+runs on every push and PR that touches `contracts/` or `cli/`, after the
+`verify` job passes, and it:
+
+1. starts a local Stellar node (`stellar container start local`, Standalone
+   network, RPC at `http://localhost:8000/soroban/rpc`);
+2. builds the PR's `trellis_core` WASM and `trellis` CLI from source, then
+   deploys that WASM and a native-XLM test token to the local node;
+3. runs real `trellis` commands against it (`init`, `lock-funds`,
+   `submit-work`, `approve-release`, `status`), plus the dispute and
+   cancellation paths and a set of error cases, checking each command's
+   `--json` output;
+4. fails if any command errors unexpectedly or any output doesn't match.
+
+No testnet access or secrets are involved, so a failure here points to your
+change, not to shared infrastructure.
+
+**Running it locally.** You need Docker, the `stellar` CLI 26.x+, and the
+`wasm32-unknown-unknown` target. From the repo root:
+
+```bash
+bash tests/cli_integration/run.sh
+```
+
+The script is idempotent: it reuses a running local node, and each run deploys
+a fresh contract with fresh agreement IDs. To debug a failure:
+
+- Each failed assertion prints `FAIL: <description> (expected …, got …)`, and
+  the summary lists them all. Copy the matching `trellis …` command from
+  `tests/cli_integration/run.sh` and rerun it by hand with the same
+  `STELLAR_RPC_URL` / `TRELLIS_CONTRACT_ID` to see the full output.
+- Inspect the node directly, e.g.
+  `curl -s -X POST http://localhost:8000/soroban/rpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'`.
+- Run `stellar container logs local` for node-side errors, and
+  `stellar container stop local` for a clean slate before rerunning.
+
+See [`tests/cli_integration/README.md`](tests/cli_integration/README.md) for
+the full list of covered flows.
 
 ## 7. Building the CLI
 
@@ -451,6 +496,42 @@ For changes that affect contract calls or wallet flows, also verify manually aga
 2. Run `npm run dev` and exercise the affected flow end to end (e.g. init, fund, submit, approve/dispute) using a Freighter Testnet account.
 3. Confirm the transaction succeeds in Freighter and the resulting state is reflected in the UI.
 
+### Frontend environment variables
+
+[`frontend/src/lib/config.ts`](frontend/src/lib/config.ts) is the single
+source of truth for the variables the frontend reads, and
+[`frontend/.env.example`](frontend/.env.example) is what new contributors copy
+to get started. **The two must list the same `VITE_*` names.** If they drift
+apart, `cp .env.example .env` gives a newcomer a setup that is silently
+missing a variable.
+
+| Variable | Required | Read by |
+|---|---|---|
+| `VITE_CONTRACT_ID` | Yes (dev fallback to the testnet contract) | `getContractId()` |
+| `VITE_RPC_URL` | Yes (dev fallback to public testnet RPC) | `getRpcUrl()` |
+| `VITE_NETWORK_PASSPHRASE` | Yes (dev fallback to the testnet passphrase) | `getNetworkPassphrase()` |
+| `VITE_INDEXER_URL` | No; empty means direct RPC polling | `getIndexerUrl()` |
+
+When you add, rename, or remove a variable:
+
+1. Update `config.ts`, and give required variables a `DEV_FALLBACKS` entry.
+2. Add or remove the key in `.env.example` in the same commit. Leave optional
+   variables empty and add a one-line comment above them.
+3. Update the table above.
+4. If tests need a value, add it to the `test.env` block in
+   `frontend/vite.config.ts`.
+
+Before opening the PR, check that the two lists match. This command prints
+nothing when they agree:
+
+```bash
+diff <(grep -o "VITE_[A-Z_]*" frontend/src/lib/config.ts | sort -u) \
+     <(grep -o "^VITE_[A-Z_]*" frontend/.env.example | sort -u)
+```
+
+Reviewers: please confirm this for any PR that touches either file.
+
+## 16. Getting Help
 ## 17. Getting Help
 
 Use the right channel for the question:

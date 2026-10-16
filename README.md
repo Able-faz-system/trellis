@@ -568,6 +568,24 @@ npm run dev
 
 Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, live contract activity stats (agreements created / milestones locked, within the RPC event retention window), and full agreement management UI.
 
+### 📡 Run the event indexer (optional)
+
+By default each browser tab polls Soroban RPC for events, and history older
+than the RPC node's retention window (~7 days) is lost. The indexer in
+[`indexer/`](indexer/README.md) stores every contract event in SQLite and
+pushes updates to the frontend over SSE:
+
+```bash
+cd indexer
+RPC_URL=https://soroban-testnet.stellar.org \
+CONTRACT_ID=CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q \
+npm start
+```
+
+Then set `VITE_INDEXER_URL=http://localhost:8787` in `frontend/.env`. See
+[DEPLOYMENT.md](DEPLOYMENT.md#event-indexer--real-time-relay) for production
+setup and the data-retention model.
+
 ### 🛠️ Build and test the contract
 
 ```bash

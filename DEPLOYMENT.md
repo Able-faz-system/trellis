@@ -530,6 +530,79 @@ the path once the JS bundle loads.
 
 ---
 
+## Event Indexer & Real-Time Relay
+
+`indexer/` is an optional service that sits between the frontend and Soroban
+RPC (#495, #496). It:
+
+- polls `getEvents` for the contract **once**, server-side, and stores every
+  event in a SQLite database;
+- serves stored history over HTTP (`/events`, `/stats`);
+- pushes new events to connected browsers over Server-Sent Events
+  (`/stream/events`, `/stream/stats`).
+
+Without it, each open browser tab polls RPC on its own, and agreement history
+disappears once events age out of the RPC node's retention window.
+
+### Deploying
+
+Requirements: Node **22.13+** (for the built-in `node:sqlite`), a persistent
+disk for the database file, and one long-running process. There are no npm
+dependencies, so no install step is needed.
+
+```bash
+cd indexer
+RPC_URL=https://soroban-testnet.stellar.org \
+CONTRACT_ID=CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q \
+DB_PATH=/var/lib/trellis/events.db \
+CORS_ORIGIN=https://your-frontend.example \
+PORT=8787 \
+npm start
+```
+
+Then build the frontend with `VITE_INDEXER_URL=https://indexer.your-domain.example`.
+See [indexer/README.md](indexer/README.md) for every option and endpoint.
+
+- **Run exactly one instance per contract.** The relay keeps its subscriber
+  list in memory and the SQLite file is single-writer, so don't scale it
+  horizontally. One instance handles thousands of SSE connections.
+- **Reverse proxies:** SSE needs response buffering off and a long read
+  timeout. The service sends `X-Accel-Buffering: no` and a heartbeat comment
+  every 15 s. For nginx, also set `proxy_read_timeout 1h;` and
+  `proxy_http_version 1.1;` on the `/stream/` location.
+- **Health checks:** use `GET /health`. It reports `status: "degraded"` while
+  RPC polls are failing, and compares `rpcLatestLedger` with
+  `latestIndexedLedger` so you can see lag.
+- **Redeploying the contract:** each database is tied to one contract ID, and
+  the service refuses to start if `CONTRACT_ID` doesn't match the one already
+  stored in `DB_PATH`. Point `DB_PATH` at a new file for the new contract.
+- **Fallback:** if `VITE_INDEXER_URL` is unset, or the stream can't connect
+  within 5 s, the frontend polls RPC directly as before. An indexer outage
+  makes the app slower to update, but it keeps working.
+
+### Data-retention model
+
+- **The RPC node is a rolling window.** Public testnet RPC keeps roughly the
+  last 7 days of events (`getHealth` → `ledgerRetentionWindow`). Anything
+  older is gone from that node.
+- **The indexer keeps events indefinitely.** It never prunes. Events are keyed
+  by their RPC event `id`, so re-ingesting an overlapping page is a no-op.
+- **First start:** ingestion begins at the node's `oldestLedger`, or at
+  `START_LEDGER` if set. Events older than that window can't be recovered from
+  this node. To get full history for an older contract, set `START_LEDGER` and
+  point `RPC_URL` at a node or archive that still holds those ledgers.
+- **Downtime:** the ingest cursor is stored in the database, so a restart
+  resumes where it stopped. If the indexer is down longer than the RPC
+  retention window, the cursor expires. The indexer then resumes from the
+  node's `oldestLedger`, logs a warning, and records the gap under `lastGap`
+  in `/health`. Events inside that gap are missing until backfilled from
+  another source.
+- **The database is the only copy of old history.** Back up `DB_PATH`
+  regularly (e.g. `sqlite3 events.db ".backup events.bak"`). Losing it means
+  falling back to whatever the RPC node still retains.
+
+---
+
 ## Known Issues & Notes
 
 - **Auth per command:** Each CLI command must be signed by the correct identity.
