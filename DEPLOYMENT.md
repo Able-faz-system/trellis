@@ -368,6 +368,28 @@ trellis status --agreement-id 01010101010101010101010101010101010101010101010101
 
 ---
 
+## Mainnet Deployment
+
+Everything above is testnet-only. A mainnet deployment moves real funds and some decisions cannot be undone, so add these precautions:
+
+- **Key management:** use a dedicated hardware-backed or offline-generated deployer identity (`stellar keys add trellis-mainnet-deployer --seed-phrase` / ledger). Never reuse testnet keys, never store the secret in `.env`, CI variables, or shell history.
+- **Review gates:** deploy only a WASM built from a tagged, reviewed release (see "Verifying Release Artifacts"); compare its sha256 against the release attestation. `make deploy-mainnet` prints the hash and requires typing `mainnet` to confirm.
+- **Irreversibility:** `init` parameters and any upgrade/admin decisions are permanent once submitted. Dry-run the full flow on testnet first, and confirm the admin and fee settings with a second reviewer before submitting.
+- **Config:** start from `frontend/.env.mainnet.example`; the CLI uses `--network mainnet`.
+
+```bash
+make build-contract
+make deploy-mainnet MAINNET_IDENTITY=trellis-mainnet-deployer
+```
+
+### CI approval gate
+
+`.github/workflows/deploy-mainnet.yml` is the manual, `environment: mainnet`-gated deploy workflow.
+
+Any workflow that targets mainnet must declare `environment: mainnet`. In **Settings → Environments → New environment → `mainnet`**, enable *Required reviewers* (at least two maintainers), restrict deployment to tags/`master`, and store mainnet secrets only as environment secrets. Jobs then pause until a reviewer manually approves.
+
+---
+
 ## Testnet Reset
 
 Stellar's testnet is periodically reset, wiping all deployed contract

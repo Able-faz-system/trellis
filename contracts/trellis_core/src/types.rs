@@ -179,4 +179,13 @@ pub struct AgreementHeader {
     /// grows, so keeping it with the agreement-level data leaves every other
     /// transition writing exactly one entry, as before.
     pub released_amounts: Map<u32, i128>,
+    /// Milestones not yet `Completed` or `Refunded`.
+    ///
+    /// Starts at `milestone_count` and is decremented by every transition into
+    /// one of those two states, so completion checks never read the milestone
+    /// entries.
+    pub open_milestones: u32,
+    /// How many milestones ended `Refunded`; the other settled ones are
+    /// `Completed`. Only used to fill the `agreement_completed` event.
+    pub refunded_milestones: u32,
 }
