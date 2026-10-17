@@ -558,6 +558,14 @@ The new resolver must not be the payer or the payee — the same neutrality inva
 - [`stellar` CLI](https://developers.stellar.org/docs/tools/cli/install-cli) 26.x+
 - Node.js 20+ (for the frontend)
 
+### 🐳 One-command local stack (Docker)
+
+```bash
+docker compose up   # or: make dev-up
+```
+
+Starts a local Stellar node, builds and deploys the contract, writes `frontend/.env.local`, and serves the frontend at **http://localhost:5173**. Point the CLI at it with `--network custom --rpc-url http://localhost:8000/soroban/rpc`. The manual steps below remain available as an alternative.
+
 ### 🖥️ Run the frontend locally
 
 ```bash
@@ -567,7 +575,7 @@ npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, live contract activity stats (agreements created / milestones locked, within the RPC event retention window), and full agreement management UI.
+The navbar network selector (testnet / mainnet / futurenet / custom) switches networks at runtime; the choice is saved in `localStorage` and defaults to your `.env` values. Open **http://localhost:5173** to see the animated landing page with the particle network background, typewriter effects, live contract activity stats (agreements created / milestones locked, within the RPC event retention window), and full agreement management UI.
 
 ### 📡 Run the event indexer (optional)
 
